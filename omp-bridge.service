@@ -1,0 +1,16 @@
+[Unit]
+Description=omp <-> Telegram bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ubuntu/omp-telegram-bridge
+Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 /home/ubuntu/omp-telegram-bridge/bridge.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
