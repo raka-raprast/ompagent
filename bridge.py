@@ -23,16 +23,21 @@ Config is read from the environment first, then from ~/.omp-agent/.env
                          omp run shell commands/edits for anyone who messages
                          it).
   OMP_BRIDGE_MODEL       Model override passed to omp (default: omp's config).
+                         Changeable at runtime from Telegram via /model.
   OMP_BRIDGE_HOME        Base dir for sessions + workspace.
                          Default: ~/.omp-agent/data
   OMP_BRIDGE_TIMEOUT     Per-message omp timeout in seconds (default: 600).
   OMP_BIN                Path to the omp binary (default: resolve from PATH).
+  OMP_BRIDGE_CRON_FILE   Scheduled-job definitions (default: ~/.omp-agent/cron.json).
+                         Absent file = no cron jobs. See the "Cron scheduler"
+                         section below for the job format.
 """
 
 import json
 import os
 import queue
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -40,6 +45,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────
@@ -71,6 +77,9 @@ SESSIONS: Path = HOME / "sessions"
 WORKSPACE: Path = HOME / "workspace"
 TIMEOUT = 600
 OMP_BIN = ""
+CRON_FILE: Path = AGENT_HOME / "cron.json"
+CRON_STATE_FILE: Path = HOME / "cron_state.json"
+CRON_JOBS: list = []
 
 TG_LIMIT = 4096  # Telegram max message length
 
@@ -78,6 +87,7 @@ TG_LIMIT = 4096  # Telegram max message length
 def configure() -> None:
     """Load run-mode config from the environment. Called once, before main()."""
     global TOKEN, ALLOW_ALL, ALLOWED, MODEL, HOME, SESSIONS, WORKSPACE, TIMEOUT, OMP_BIN
+    global CRON_FILE, CRON_STATE_FILE, CRON_JOBS
 
     TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not TOKEN:
@@ -95,9 +105,38 @@ def configure() -> None:
     WORKSPACE = HOME / "workspace"
     TIMEOUT = int(os.environ.get("OMP_BRIDGE_TIMEOUT", "600"))
     OMP_BIN = os.environ.get("OMP_BIN", "") or shutil.which("omp") or str(Path.home() / ".local" / "bin" / "omp")
+    CRON_FILE = Path(os.environ.get("OMP_BRIDGE_CRON_FILE", str(AGENT_HOME / "cron.json")))
 
     SESSIONS.mkdir(parents=True, exist_ok=True)
     WORKSPACE.mkdir(parents=True, exist_ok=True)
+    CRON_STATE_FILE = HOME / "cron_state.json"
+    CRON_JOBS = _load_cron_jobs(CRON_FILE)
+
+
+# ── Model override ───────────────────────────────────────────────────────────
+
+
+def _write_env_var(key: str, value: str) -> None:
+    """Update or add KEY=VALUE in the .env file, preserving every other line."""
+    lines = ENV_FILE.read_text().splitlines() if ENV_FILE.exists() else []
+    out, found = [], False
+    for line in lines:
+        if line.strip().startswith(f"{key}="):
+            out.append(f"{key}={value}")
+            found = True
+        else:
+            out.append(line)
+    if not found:
+        out.append(f"{key}={value}")
+    ENV_FILE.write_text("\n".join(out) + "\n")
+    ENV_FILE.chmod(0o600)
+
+
+def set_model(new_model: str) -> None:
+    """Change the model omp is invoked with, in-process and in ~/.omp-agent/.env."""
+    global MODEL
+    MODEL = new_model.strip()
+    _write_env_var("OMP_BRIDGE_MODEL", MODEL)
 
 
 # ── Telegram API helpers ────────────────────────────────────────────────────
@@ -128,6 +167,9 @@ def send(chat_id, text: str) -> None:
         api("sendMessage", {"chat_id": chat_id, "text": text[i : i + TG_LIMIT]})
 
 
+TYPING_REFRESH = 4  # seconds; Telegram's "typing…" indicator fades after ~5s unread
+
+
 def typing(chat_id) -> None:
     api("sendChatAction", {"chat_id": chat_id, "action": "typing"})
 
@@ -145,6 +187,17 @@ def has_session(sdir: Path) -> bool:
     return any(sdir.glob("*.jsonl"))
 
 
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    # Callers launch with start_new_session=True, putting the child in its own process
+    # group; killing just the top pid would strand any shell children (auto-approve runs
+    # shell commands) still holding the stdout pipe open, so communicate() would hang past
+    # the kill.
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+
+
 def run_omp(chat_id, message: str) -> str:
     sdir = session_dir(chat_id)
     cmd = [OMP_BIN, "-p", "--session-dir", str(sdir), "--auto-approve", "--cwd", str(WORKSPACE)]
@@ -153,20 +206,191 @@ def run_omp(chat_id, message: str) -> str:
     if MODEL:
         cmd += ["--model", MODEL]
     cmd.append(message)
+
     try:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=TIMEOUT,
-            cwd=str(WORKSPACE),
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=str(WORKSPACE), start_new_session=True
         )
-    except subprocess.TimeoutExpired:
-        return f"⏱️ omp timed out after {TIMEOUT}s."
-    out = proc.stdout.decode(errors="replace").strip()
+    except OSError as e:
+        return f"⚠️ failed to start omp: {e}"
+
+
+    deadline = time.monotonic() + TIMEOUT
+    try:
+        while True:
+            typing(chat_id)  # re-armed every loop so the indicator never lapses mid-run
+            try:
+                stdout, _ = proc.communicate(timeout=TYPING_REFRESH)
+                break
+            except subprocess.TimeoutExpired:
+                if time.monotonic() >= deadline:
+                    _kill_process_group(proc)
+                    proc.communicate()
+                    return f"⏱️ omp timed out after {TIMEOUT}s."
+    except BaseException:
+        _kill_process_group(proc)
+        proc.communicate()
+        raise
+
+    out = stdout.decode(errors="replace").strip()
     if proc.returncode != 0 and not out:
         return f"⚠️ omp exited {proc.returncode} with no output."
     return out or "(omp produced no output)"
+
+
+# ── Cron scheduler ────────────────────────────────────────────────────────────
+#
+# Job definitions live in a data file (default ~/.omp-agent/cron.json), not in
+# this source — mirrors how the bridge's own config lives in .env. Each job:
+#   id         stable string, used as the dedupe key in cron_state.json
+#   name       display name, used only in [cron] log lines
+#   schedule   5-field cron expression (minute hour day month weekday), evaluated
+#              in the machine's local time zone
+#   chat_id    Telegram chat to deliver to (group ids are negative)
+#   thread_id  optional forum-topic id within that chat
+#   kind       "script" — run `argv`, deliver stdout verbatim
+#              "prompt" — run `omp -p <prompt>` (optionally scoped by `tools`,
+#                         overridden by `model`), deliver its stdout
+#   timeout    seconds before the job is killed; default 60 for scripts, 300 for prompts
+# A job silent on stdout (matching the migrated Hermes scripts' own convention)
+# delivers nothing — that's not a failure, just "nothing to report today."
+
+CRON_CHECK_INTERVAL = 20  # seconds; coarse poll, still fine enough to not miss a minute
+
+
+def _load_cron_jobs(path: Path) -> list:
+    if not path.exists():
+        return []
+    try:
+        jobs = json.loads(path.read_text()).get("jobs", [])
+    except Exception as e:  # noqa: BLE001
+        print(f"[cron] failed to parse {path}: {e}", flush=True)
+        return []
+    return [j for j in jobs if j.get("enabled", True)]
+
+
+def _load_cron_state() -> dict:
+    if CRON_STATE_FILE.exists():
+        try:
+            return json.loads(CRON_STATE_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_cron_state(state: dict) -> None:
+    try:
+        CRON_STATE_FILE.write_text(json.dumps(state))
+    except OSError as e:
+        print(f"[cron] failed to persist state: {e}", flush=True)
+
+
+def _cron_field_matches(spec: str, value: int) -> bool:
+    for part in spec.split(","):
+        step = 1
+        if "/" in part:
+            part, step_s = part.split("/", 1)
+            step = int(step_s)
+        if part == "*":
+            if value % step == 0:
+                return True
+            continue
+        lo, hi = (int(x) for x in part.split("-", 1)) if "-" in part else (int(part), int(part))
+        if lo <= value <= hi and (value - lo) % step == 0:
+            return True
+    return False
+
+
+def cron_due(expr: str, dt: datetime) -> bool:
+    """True when `dt` matches a standard 5-field cron expression, in dt's zone."""
+    minute, hour, dom, month, dow = expr.split()
+    py_dow = dt.isoweekday() % 7  # cron: 0=Sunday..6=Saturday; Python: 1=Mon..7=Sun
+    dow_candidates = (py_dow, 7) if py_dow == 0 else (py_dow,)
+    return (
+        _cron_field_matches(minute, dt.minute)
+        and _cron_field_matches(hour, dt.hour)
+        and _cron_field_matches(dom, dt.day)
+        and _cron_field_matches(month, dt.month)
+        and any(_cron_field_matches(dow, c) for c in dow_candidates)
+    )
+
+
+def deliver(chat_id: str, text: str, thread_id: str | None = None) -> None:
+    """Send cron output verbatim; silently does nothing for empty text (not an error)."""
+    text = text.strip()
+    if not text:
+        return
+    params = {"chat_id": chat_id}
+    if thread_id:
+        params["message_thread_id"] = thread_id
+    for i in range(0, len(text), TG_LIMIT):
+        api("sendMessage", dict(params, text=text[i : i + TG_LIMIT]))
+
+
+def _run_cron_subprocess(argv: list, timeout: int) -> str:
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    except OSError as e:
+        print(f"[cron] failed to start {argv!r}: {e}", flush=True)
+        return ""
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(proc)
+        proc.communicate()
+        print(f"[cron] {argv!r} timed out after {timeout}s", flush=True)
+        return ""
+    if proc.returncode != 0:
+        err = stderr.decode(errors="replace").strip()[:500]
+        print(f"[cron] {argv!r} exited {proc.returncode}: {err}", flush=True)
+    return stdout.decode(errors="replace").strip()
+
+
+def _run_cron_job(job: dict) -> str:
+    kind = job.get("kind")
+    if kind == "script":
+        return _run_cron_subprocess(job["argv"], job.get("timeout", 60))
+    if kind == "prompt":
+        cmd = [OMP_BIN, "-p", "--no-session", "--auto-approve", "--cwd", str(WORKSPACE)]
+        model = job.get("model") or MODEL
+        if model:
+            cmd += ["--model", model]
+        if job.get("tools"):
+            cmd += ["--tools", job["tools"]]
+        cmd.append(job["prompt"])
+        return _run_cron_subprocess(cmd, job.get("timeout", 300))
+    print(f"[cron] job {job.get('id')!r} has unknown kind {kind!r}", flush=True)
+    return ""
+
+
+def _cron_worker(job: dict) -> None:
+    print(f"[cron] running {job.get('name', job.get('id'))!r}", flush=True)
+    try:
+        text = _run_cron_job(job)
+    except Exception as e:  # noqa: BLE001
+        print(f"[cron] {job.get('name', job.get('id'))!r} failed: {e}", flush=True)
+        return
+    deliver(job["chat_id"], text, job.get("thread_id"))
+    print(f"[cron] {job.get('name', job.get('id'))!r} {'delivered' if text.strip() else 'silent (no output)'}", flush=True)
+
+
+def _cron_loop() -> None:
+    if not CRON_JOBS:
+        return
+    print(f"[cron] {len(CRON_JOBS)} job(s) loaded from {CRON_FILE}", flush=True)
+    state = _load_cron_state()
+    while True:
+        now = datetime.now()
+        minute_key = now.strftime("%Y-%m-%d %H:%M")
+        for job in CRON_JOBS:
+            job_id = job.get("id")
+            if not job_id or state.get(job_id) == minute_key:
+                continue
+            if cron_due(job.get("schedule", ""), now):
+                state[job_id] = minute_key
+                _save_cron_state(state)
+                threading.Thread(target=_cron_worker, args=(job,), daemon=True).start()
+        time.sleep(CRON_CHECK_INTERVAL)
 
 
 # ── Per-chat workers ─────────────────────────────────────────────────────────
@@ -179,7 +403,6 @@ def _worker_loop(chat_id, q: "queue.Queue") -> None:
     while True:
         message = q.get()
         try:
-            typing(chat_id)
             reply = run_omp(chat_id, message)
             send(chat_id, reply)
         except Exception as e:  # noqa: BLE001
@@ -220,15 +443,27 @@ def handle_message(msg: dict) -> None:
     if text.startswith("/"):
         cmd = text.split()[0].lstrip("/").split("@")[0].lower()
         if cmd == "start":
-            send(chat_id, "🤖 omp bridge online. Send a message and I'll run it through omp. /reset clears our conversation.")
+            send(chat_id, "🤖 omp bridge online. Send a message and I'll run it through omp. /reset clears our conversation, /model shows or changes the model.")
             return
         if cmd == "reset":
             sdir = session_dir(chat_id)
             shutil.rmtree(sdir, ignore_errors=True)
             send(chat_id, "🧹 Conversation reset.")
             return
+        if cmd == "model":
+            arg = text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else ""
+            if not arg:
+                send(chat_id, f"Current model: {MODEL or '(omp config default)'}\nUsage: /model <name>, or /model default to clear the override.")
+                return
+            if arg.lower() in ("default", "clear", "reset", "none"):
+                set_model("")
+                send(chat_id, "✅ Model override cleared — omp will use its configured default.")
+                return
+            set_model(arg)
+            send(chat_id, f"✅ Model set to {MODEL}. Takes effect on the next message.")
+            return
         if cmd == "help":
-            send(chat_id, "Commands: /start, /reset (new conversation), /help. Anything else is sent to omp.")
+            send(chat_id, "Commands: /start, /reset (new conversation), /model [name] (show/change model), /help. Anything else is sent to omp.")
             return
         # Unknown slash command -> pass through to omp as normal text.
 
@@ -247,6 +482,7 @@ def main() -> None:
     uname = me["result"].get("username")
     print(f"[bridge] connected as @{uname}", flush=True)
     print(f"[bridge] omp={OMP_BIN} model={MODEL or '(config default)'} allowed={'ALL' if ALLOW_ALL else ALLOWED}", flush=True)
+    threading.Thread(target=_cron_loop, daemon=True).start()
 
     offset = None
     while True:
