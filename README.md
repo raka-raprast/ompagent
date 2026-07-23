@@ -56,9 +56,15 @@ systemctl --user restart omp-bridge
 
 - `/start` — confirms the bridge is online.
 - `/reset` — clears the conversation, starting a fresh omp session.
-- `/model` — shows the current model override.
-- `/model <name>` — switches omp to `<name>` on the next message, and saves it
-  to `~/.omp-agent/.env` so it survives a bridge restart.
+- `/model` — opens an inline-keyboard picker: pick a provider, then a model,
+  drilling down and paginating in place. Only models the configured
+  providers can actually serve show up (a "connected" catalog straight from
+  `omp models --json`), grouped by provider with a `🔄 Refresh` button.
+- `/model <name>` — searches the connected catalog by substring. An exact
+  single match switches immediately; multiple matches render as a picker.
+  No match falls back to passing `<name>` straight to omp's own `--model`
+  fuzzy matcher. Either way the choice is saved to `~/.omp-agent/.env` so it
+  survives a bridge restart.
 - `/model default` — clears the override, back to omp's configured default.
 - `/help` — lists commands. Anything else is sent straight to omp.
 

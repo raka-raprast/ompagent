@@ -174,6 +174,36 @@ def typing(chat_id) -> None:
     api("sendChatAction", {"chat_id": chat_id, "action": "typing"})
 
 
+def send_keyboard(chat_id, text: str, keyboard: dict):
+    """Send a message with an inline keyboard attached. Returns the new message_id, or None on failure."""
+    resp = api("sendMessage", {
+        "chat_id": chat_id,
+        "text": text,
+        "reply_markup": json.dumps(keyboard),
+    })
+    if not resp.get("ok"):
+        print(f"[bridge] send_keyboard failed: {resp.get('error') or resp.get('description')}", flush=True)
+        return None
+    return resp["result"]["message_id"]
+
+
+def edit_message(chat_id, message_id, text: str, keyboard: dict | None = None) -> None:
+    """Edit an existing message's text (and reply_markup, if given) in place."""
+    params = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if keyboard is not None:
+        params["reply_markup"] = json.dumps(keyboard)
+    resp = api("editMessageText", params)
+    if not resp.get("ok"):
+        print(f"[bridge] edit_message failed: {resp.get('error') or resp.get('description')}", flush=True)
+
+
+def answer_callback(callback_query_id: str, text: str = "") -> None:
+    params = {"callback_query_id": callback_query_id}
+    if text:
+        params["text"] = text
+    api("answerCallbackQuery", params)
+
+
 # ── omp runner ──────────────────────────────────────────────────────────────
 
 
@@ -236,6 +266,348 @@ def run_omp(chat_id, message: str) -> str:
     if proc.returncode != 0 and not out:
         return f"⚠️ omp exited {proc.returncode} with no output."
     return out or "(omp produced no output)"
+
+
+# ── Model catalog & picker ───────────────────────────────────────────────────
+#
+# Backs the interactive /model picker. `omp models --json` reports every
+# model the locally configured providers can actually serve — only
+# providers with credentials show up, i.e. "connected" models, not omp's
+# full static catalog. Grouped by provider into an inline keyboard, drilled
+# down provider -> model, edited in place as the user navigates.
+
+MODELS_CACHE_TTL = 300  # seconds; `omp models --json` shells out + hits the catalog db
+PROVIDER_PAGE_SIZE = 10
+MODEL_PAGE_SIZE = 8
+
+_models_cache: dict = {"data": None, "fetched_at": 0.0}
+
+# Friendly display names for common provider slugs; anything else falls back
+# to a title-cased version of the slug, so a newly authenticated provider
+# shows up immediately without a code change.
+_PROVIDER_LABELS = {
+    "anthropic": "Anthropic",
+    "openai": "OpenAI",
+    "openai-codex": "OpenAI Codex",
+    "google": "Google",
+    "google-vertex": "Google Vertex",
+    "azure": "Azure OpenAI",
+    "bedrock": "AWS Bedrock",
+    "openrouter": "OpenRouter",
+    "groq": "Groq",
+    "mistral": "Mistral",
+    "deepseek": "DeepSeek",
+    "xai": "xAI",
+    "cohere": "Cohere",
+    "ollama": "Ollama",
+    "together": "Together AI",
+}
+
+
+def _provider_label(slug: str) -> str:
+    return _PROVIDER_LABELS.get(slug, slug.replace("-", " ").replace("_", " ").title())
+
+
+def get_models(force: bool = False) -> list:
+    """Return the connected model catalog, caching for MODELS_CACHE_TTL seconds.
+
+    Falls back to a stale cache (rather than an empty list) if `omp models`
+    fails transiently, so a picker mid-navigation doesn't suddenly go blank.
+    """
+    now = time.monotonic()
+    cached = _models_cache["data"]
+    if cached is not None and not force and (now - _models_cache["fetched_at"]) < MODELS_CACHE_TTL:
+        return cached
+
+    try:
+        proc = subprocess.run([OMP_BIN, "models", "--json"], capture_output=True, text=True, timeout=30)
+        models = json.loads(proc.stdout).get("models", [])
+    except Exception as e:  # noqa: BLE001
+        print(f"[bridge] failed to load model catalog: {e}", flush=True)
+        return cached or []
+
+    _models_cache["data"] = models
+    _models_cache["fetched_at"] = now
+    return models
+
+
+def group_by_provider(models: list, current_selector: str) -> list:
+    """Group models by provider, sorted by display name.
+
+    Each entry keeps its (selector, name) — `selector` is exactly what
+    `--model` accepts, `name` is the friendly display string.
+    """
+    by_slug: dict = {}
+    for m in models:
+        slug = m.get("provider", "")
+        if not slug:
+            continue
+        by_slug.setdefault(slug, []).append({"selector": m["selector"], "name": m.get("name", m["id"])})
+
+    current_provider = (
+        current_selector.split("/", 1)[0] if current_selector and "/" in current_selector else None
+    )
+
+    providers = []
+    for slug, entries in by_slug.items():
+        entries.sort(key=lambda e: e["selector"])
+        providers.append(
+            {
+                "slug": slug,
+                "name": _provider_label(slug),
+                "models": entries,
+                "total": len(entries),
+                "is_current": slug == current_provider,
+            }
+        )
+    providers.sort(key=lambda p: p["name"].lower())
+    return providers
+
+
+def search_models(models: list, query: str) -> list:
+    """Substring match against selector or display name, case-insensitive."""
+    q = query.strip().lower()
+    if not q:
+        return []
+    matches = [
+        {"selector": m["selector"], "name": m.get("name", m["id"])}
+        for m in models
+        if q in m["selector"].lower() or q in m.get("name", "").lower()
+    ]
+    matches.sort(key=lambda e: e["selector"])
+    return matches
+
+
+def _btn(text: str, data: str) -> dict:
+    return {"text": text, "callback_data": data}
+
+
+def build_provider_keyboard(providers: list, page: int = 0) -> tuple:
+    """Paginated top-level provider picker. Returns (keyboard, page, total_pages)."""
+    total = len(providers)
+    total_pages = max(1, -(-total // PROVIDER_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start = page * PROVIDER_PAGE_SIZE
+    chunk = providers[start : start + PROVIDER_PAGE_SIZE]
+
+    buttons = []
+    for p in chunk:
+        label = f"{p['name']} ({p['total']})"
+        if p["is_current"]:
+            label = f"\u2713 {label}"
+        buttons.append(_btn(label, f"mp:{p['slug']}"))
+    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(_btn("\u25c0 Prev", f"pg:{page - 1}"))
+        nav.append(_btn(f"{page + 1}/{total_pages}", "mx:noop"))
+        if page < total_pages - 1:
+            nav.append(_btn("Next \u25b6", f"pg:{page + 1}"))
+        rows.append(nav)
+
+    rows.append([_btn("\U0001f504 Refresh", "mr"), _btn("\u2717 Cancel", "mx")])
+    return {"inline_keyboard": rows}, page, total_pages
+
+
+def build_model_keyboard(entries: list, page: int = 0, show_back: bool = True) -> tuple:
+    """Paginated model picker. Returns (keyboard, page_info_suffix_for_header)."""
+    total = len(entries)
+    total_pages = max(1, -(-total // MODEL_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start = page * MODEL_PAGE_SIZE
+    end = min(start + MODEL_PAGE_SIZE, total)
+
+    buttons = []
+    for i, entry in enumerate(entries[start:end]):
+        abs_idx = start + i
+        label = entry["name"] or entry["selector"]
+        if len(label) > 38:
+            label = label[:35] + "..."
+        buttons.append(_btn(label, f"mm:{abs_idx}"))
+    rows = [buttons[i : i + 2] for i in range(0, len(buttons), 2)]
+
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(_btn("\u25c0 Prev", f"mg:{page - 1}"))
+        nav.append(_btn(f"{page + 1}/{total_pages}", "mx:noop"))
+        if page < total_pages - 1:
+            nav.append(_btn("Next \u25b6", f"mg:{page + 1}"))
+        rows.append(nav)
+
+    last_row = [_btn("\u25c0 Back", "mb")] if show_back else []
+    last_row.append(_btn("\u2717 Cancel", "mx"))
+    rows.append(last_row)
+
+    page_info = f" ({start + 1}\u2013{end} of {total})" if total_pages > 1 else ""
+    return {"inline_keyboard": rows}, page_info
+
+
+# In-memory picker session state, keyed by str(chat_id). Deliberately not
+# persisted to disk: a picker left open across a bridge restart just reports
+# "expired" and the user re-issues /model.
+_picker_sessions: dict = {}
+_picker_lock = threading.Lock()
+
+
+def _model_header(current: str) -> str:
+    return f"\u2699 Model Configuration\n\nCurrent model: {current or '(omp config default)'}\nSelect a provider:"
+
+
+def send_model_picker(chat_id) -> None:
+    models = get_models()
+    if not models:
+        send(
+            chat_id,
+            "\u26a0\ufe0f No connected models found. Check the provider credentials "
+            "`omp` is configured with (`omp models` on the host).",
+        )
+        return
+    providers = group_by_provider(models, MODEL)
+    keyboard, _page, _total_pages = build_provider_keyboard(providers, 0)
+    msg_id = send_keyboard(chat_id, _model_header(MODEL), keyboard)
+    if msg_id is not None:
+        with _picker_lock:
+            _picker_sessions[str(chat_id)] = {"mode": "provider", "providers": providers, "page": 0}
+
+
+def send_model_search_results(chat_id, query: str, matches: list) -> None:
+    keyboard, page_info = build_model_keyboard(matches, 0, show_back=False)
+    text = f"\u2699 Model Configuration\n\n{len(matches)} models match '{query}'{page_info}\nSelect one:"
+    msg_id = send_keyboard(chat_id, text, keyboard)
+    if msg_id is not None:
+        with _picker_lock:
+            _picker_sessions[str(chat_id)] = {"mode": "search", "list": matches, "page": 0}
+
+
+def handle_callback_query(cq: dict) -> None:
+    data = cq.get("data") or ""
+    cq_id = cq.get("id")
+    message = cq.get("message") or {}
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    message_id = message.get("message_id")
+
+    if chat_id is None or message_id is None:
+        if cq_id:
+            answer_callback(cq_id)
+        return
+
+    if not authorized(chat_id):
+        answer_callback(cq_id, "\u26d4 Not authorized.")
+        return
+
+    if data == "mx:noop":
+        answer_callback(cq_id)
+        return
+
+    key = str(chat_id)
+    with _picker_lock:
+        session = _picker_sessions.get(key)
+    if session is None:
+        answer_callback(cq_id, "Picker expired \u2014 use /model again.")
+        return
+
+    if data == "mx":
+        with _picker_lock:
+            _picker_sessions.pop(key, None)
+        edit_message(chat_id, message_id, "Model selection cancelled.", {"inline_keyboard": []})
+        answer_callback(cq_id)
+        return
+
+    if data == "mr":
+        models = get_models(force=True)
+        providers = group_by_provider(models, MODEL)
+        session["mode"], session["providers"], session["page"] = "provider", providers, 0
+        keyboard, _page, _total_pages = build_provider_keyboard(providers, 0)
+        edit_message(chat_id, message_id, _model_header(MODEL), keyboard)
+        answer_callback(cq_id, "Refreshed.")
+        return
+
+    if data == "mb":
+        if session.get("mode") == "model":
+            session["mode"] = "provider"
+            keyboard, _page, _total_pages = build_provider_keyboard(
+                session["providers"], session.get("provider_page", 0)
+            )
+            edit_message(chat_id, message_id, _model_header(MODEL), keyboard)
+        else:
+            with _picker_lock:
+                _picker_sessions.pop(key, None)
+            edit_message(chat_id, message_id, "Model selection cancelled.", {"inline_keyboard": []})
+        answer_callback(cq_id)
+        return
+
+    if data.startswith("pg:"):
+        if session.get("mode") != "provider":
+            answer_callback(cq_id)
+            return
+        page = int(data.split(":", 1)[1])
+        session["page"] = page
+        keyboard, _page, _total_pages = build_provider_keyboard(session["providers"], page)
+        edit_message(chat_id, message_id, _model_header(MODEL), keyboard)
+        answer_callback(cq_id)
+        return
+
+    if data.startswith("mp:"):
+        slug = data.split(":", 1)[1]
+        provider = next((p for p in session.get("providers", []) if p["slug"] == slug), None)
+        if provider is None:
+            answer_callback(cq_id, "Provider not found.")
+            return
+        session["mode"] = "model"
+        session["provider_page"] = session.get("page", 0)
+        session["list"] = provider["models"]
+        session["model_page"] = 0
+        session["provider_name"] = provider["name"]
+        keyboard, page_info = build_model_keyboard(provider["models"], 0)
+        edit_message(
+            chat_id,
+            message_id,
+            f"\u2699 Model Configuration\n\nProvider: {provider['name']}{page_info}\nSelect a model:",
+            keyboard,
+        )
+        answer_callback(cq_id)
+        return
+
+    if data.startswith("mg:"):
+        mode = session.get("mode")
+        if mode not in ("model", "search"):
+            answer_callback(cq_id)
+            return
+        page = int(data.split(":", 1)[1])
+        session["model_page" if mode == "model" else "page"] = page
+        entries = session.get("list", [])
+        keyboard, page_info = build_model_keyboard(entries, page, show_back=(mode == "model"))
+        if mode == "model":
+            text = f"\u2699 Model Configuration\n\nProvider: {session['provider_name']}{page_info}\nSelect a model:"
+        else:
+            text = f"\u2699 Model Configuration\n\n{len(entries)} models match your search{page_info}\nSelect one:"
+        edit_message(chat_id, message_id, text, keyboard)
+        answer_callback(cq_id)
+        return
+
+    if data.startswith("mm:"):
+        idx = int(data.split(":", 1)[1])
+        entries = session.get("list", [])
+        if idx < 0 or idx >= len(entries):
+            answer_callback(cq_id, "Invalid selection.")
+            return
+        entry = entries[idx]
+        set_model(entry["selector"])
+        with _picker_lock:
+            _picker_sessions.pop(key, None)
+        edit_message(
+            chat_id, message_id,
+            f"\u2705 Switched to {entry['selector']} ({entry['name']})",
+            {"inline_keyboard": []},
+        )
+        answer_callback(cq_id, "Model switched!")
+        return
+
+    answer_callback(cq_id)
 
 
 # ── Cron scheduler ────────────────────────────────────────────────────────────
@@ -453,14 +825,28 @@ def handle_message(msg: dict) -> None:
         if cmd == "model":
             arg = text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else ""
             if not arg:
-                send(chat_id, f"Current model: {MODEL or '(omp config default)'}\nUsage: /model <name>, or /model default to clear the override.")
+                send_model_picker(chat_id)
                 return
             if arg.lower() in ("default", "clear", "reset", "none"):
                 set_model("")
+                with _picker_lock:
+                    _picker_sessions.pop(str(chat_id), None)
                 send(chat_id, "✅ Model override cleared — omp will use its configured default.")
                 return
+            matches = search_models(get_models(), arg)
+            if len(matches) == 1:
+                set_model(matches[0]["selector"])
+                with _picker_lock:
+                    _picker_sessions.pop(str(chat_id), None)
+                send(chat_id, f"✅ Model set to {matches[0]['selector']} ({matches[0]['name']}). Takes effect on the next message.")
+                return
+            if len(matches) > 1:
+                send_model_search_results(chat_id, arg, matches)
+                return
+            # No hit in the connected catalog — pass through as-is; omp's own
+            # --model fuzzy matcher may still resolve it.
             set_model(arg)
-            send(chat_id, f"✅ Model set to {MODEL}. Takes effect on the next message.")
+            send(chat_id, f"✅ Model set to {MODEL} (not found in the connected catalog — passed through as-is). Verify with /model.")
             return
         if cmd == "help":
             send(chat_id, "Commands: /start, /reset (new conversation), /model [name] (show/change model), /help. Anything else is sent to omp.")
@@ -503,6 +889,13 @@ def main() -> None:
                     handle_message(msg)
                 except Exception as e:  # noqa: BLE001
                     print(f"[bridge] handle error: {e}", flush=True)
+                continue
+            cq = upd.get("callback_query")
+            if cq:
+                try:
+                    handle_callback_query(cq)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[bridge] callback error: {e}", flush=True)
 
 
 # ── Setup wizard ──────────────────────────────────────────────────────────────
