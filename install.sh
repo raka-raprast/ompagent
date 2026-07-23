@@ -3,11 +3,11 @@
 # machine), fetches the bridge, and hands off to the interactive setup
 # wizard.
 #
-#   curl -fsSL https://raw.githubusercontent.com/raka-raprast/ompagent/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/raka-raprast/punakawan/main/install.sh | bash
 #
 set -euo pipefail
 
-REPO_URL="https://github.com/raka-raprast/ompagent.git"
+REPO_URL="https://github.com/raka-raprast/punakawan.git"
 SRC_DIR="${OMP_AGENT_SRC:-$HOME/.omp-agent/src}"
 OMP_INSTALL_URL="https://omp.sh/install"
 

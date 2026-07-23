@@ -13,13 +13,13 @@ file, stdlib only, one setup command.
 macOS/Linux:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/raka-raprast/ompagent/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/raka-raprast/punakawan/main/install.sh | bash
 ```
 
 Windows (PowerShell):
 
 ```powershell
-irm https://raw.githubusercontent.com/raka-raprast/ompagent/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/raka-raprast/punakawan/main/install.ps1 | iex
 ```
 
 Either script checks for `omp` itself first and installs it if it's missing

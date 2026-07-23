@@ -2,7 +2,7 @@
 # already on this machine), fetches the bridge, and hands off to the
 # interactive setup wizard.
 #
-#   irm https://raw.githubusercontent.com/raka-raprast/ompagent/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/raka-raprast/punakawan/main/install.ps1 | iex
 #
 # Note: the bridge's background service today is systemd --user (Linux
 # only). On Windows, `setup` still writes ~/.omp-agent/.env and this script
@@ -12,7 +12,7 @@
 
 $ErrorActionPreference = "Stop"
 
-$RepoUrl = "https://github.com/raka-raprast/ompagent.git"
+$RepoUrl = "https://github.com/raka-raprast/punakawan.git"
 $SrcDir = if ($env:OMP_AGENT_SRC) { $env:OMP_AGENT_SRC } else { Join-Path $env:USERPROFILE ".omp-agent\src" }
 $OmpInstallUrl = "https://omp.sh/install.ps1"
 
