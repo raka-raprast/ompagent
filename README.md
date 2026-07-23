@@ -10,12 +10,23 @@ file, stdlib only, one setup command.
 
 ## Quickstart
 
+macOS/Linux:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/raka-raprast/ompagent/main/install.sh | bash
 ```
 
-This clones the repo to `~/.omp-agent/src` (or reuses a local checkout) and
-runs the setup wizard, which:
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/raka-raprast/ompagent/main/install.ps1 | iex
+```
+
+Either script checks for `omp` itself first and installs it if it's missing
+(`curl -fsSL https://omp.sh/install | sh` / `irm https://omp.sh/install.ps1 |
+iex` — omp's own official installer), then clones this repo to
+`~/.omp-agent/src` (or reuses a local checkout) and runs the setup wizard,
+which:
 
 1. Asks for your bot token (from [@BotFather](https://t.me/BotFather)) and
    verifies it against the Telegram API.
@@ -31,6 +42,11 @@ runs the setup wizard, which:
    checkout itself — that way hand-editing `bridge.py` in your working
    copy can never break the running bot; only `/update` (or re-running
    `setup`) redeploys it, and only after a byte-compile check passes.
+
+   macOS and Windows have no `systemd --user` equivalent wired up yet — the
+   wizard writes `~/.omp-agent/.env` and skips the service step, so you run
+   the bridge yourself (see [Running manually](#running-manually)) or wrap
+   it in `launchd`/Task Scheduler on your own.
 
 Already have a checkout? Run the wizard directly:
 
@@ -48,6 +64,12 @@ python3 bridge.py
 ```
 
 Reads config from the environment first, then from `~/.omp-agent/.env`.
+
+Cross-platform: process spawning/killing (`/stop`, cron job timeouts, the
+`/login` RPC subprocess) uses real process groups + `SIGKILL` on
+Linux/macOS and `taskkill /T /F` on Windows, so those code paths work
+natively either way — it's only the background-service story
+(`systemd --user`) that's Linux-only for now.
 
 ## Managing the service
 

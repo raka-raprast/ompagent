@@ -121,13 +121,13 @@ def configure() -> None:
 
     TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not TOKEN:
-        sys.exit(f"No TELEGRAM_BOT_TOKEN configured. Run: python3 {Path(__file__).name} setup")
+        sys.exit(f"No TELEGRAM_BOT_TOKEN configured. Run: {sys.executable} {Path(__file__).name} setup")
 
     allowed_raw = os.environ.get("OMP_BRIDGE_ALLOWED", "").strip()
     ALLOW_ALL = allowed_raw == "*"
     ALLOWED = set() if ALLOW_ALL else {c.strip() for c in allowed_raw.split(",") if c.strip()}
     if not ALLOW_ALL and not ALLOWED:
-        sys.exit(f"No OMP_BRIDGE_ALLOWED configured. Run: python3 {Path(__file__).name} setup")
+        sys.exit(f"No OMP_BRIDGE_ALLOWED configured. Run: {sys.executable} {Path(__file__).name} setup")
 
     MODEL = os.environ.get("OMP_BRIDGE_MODEL", "").strip()
     HOME = Path(os.environ.get("OMP_BRIDGE_HOME", str(AGENT_HOME / "data")))
@@ -286,11 +286,26 @@ def has_session(sdir: Path) -> bool:
     return any(sdir.glob("*.jsonl"))
 
 
+IS_WINDOWS = sys.platform == "win32"
+
+# Every long-lived child (omp itself, or a cron/login subprocess) is launched
+# in its own process group so a kill takes shell children with it too —
+# auto-approve runs shell commands, and killing just the launcher would
+# strand them still holding the stdout pipe open, hanging communicate() past
+# the kill. POSIX: a real process group + SIGKILL. Windows: CREATE_NEW_PROCESS_GROUP
+# at spawn time, taskkill /T (tree) /F (force) to tear it down.
+POPEN_GROUP_KWARGS = (
+    {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if IS_WINDOWS else {"start_new_session": True}
+)
+
+
 def _kill_process_group(proc: subprocess.Popen) -> None:
-    # Callers launch with start_new_session=True, putting the child in its own process
-    # group; killing just the top pid would strand any shell children (auto-approve runs
-    # shell commands) still holding the stdout pipe open, so communicate() would hang past
-    # the kill.
+    if IS_WINDOWS:
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, check=False)
+        except OSError:
+            pass
+        return
     try:
         os.killpg(proc.pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -310,7 +325,7 @@ def run_omp(chat_id, message: str, attachments: list | None = None) -> str:
 
     try:
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=str(WORKSPACE), start_new_session=True
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, cwd=str(WORKSPACE), **POPEN_GROUP_KWARGS
         )
     except OSError as e:
         return f"⚠️ failed to start omp: {e}"
@@ -1233,7 +1248,7 @@ def _login_worker(chat_id, provider: dict) -> None:
         proc = subprocess.Popen(
             [OMP_BIN, "--mode", "rpc", "--no-session", "--cwd", str(WORKSPACE)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, bufsize=1, start_new_session=True,
+            text=True, bufsize=1, **POPEN_GROUP_KWARGS,
         )
     except OSError as e:
         send(chat_id, f"\u26a0\ufe0f couldn't start omp: {e}")
@@ -1402,7 +1417,7 @@ def deliver(chat_id: str, text: str, thread_id: str | None = None) -> None:
 
 def _run_cron_subprocess(argv: list, timeout: int) -> str:
     try:
-        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **POPEN_GROUP_KWARGS)
     except OSError as e:
         print(f"[cron] failed to start {argv!r}: {e}", flush=True)
         return ""
@@ -1818,7 +1833,7 @@ def setup_wizard() -> None:
     else:
         print("\nNo systemd found on this system.")
 
-    print(f"\nSetup complete. Run it with: python3 {Path(__file__).name}")
+    print(f"\nSetup complete. Run it with: {sys.executable} {Path(__file__).name}")
 
 
 if __name__ == "__main__":
