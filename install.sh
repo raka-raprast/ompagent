@@ -3,7 +3,7 @@
 # machine), fetches the bridge, and hands off to the interactive setup
 # wizard.
 #
-#   curl -fsSL https://raw.githubusercontent.com/raka-raprast/punakawan/main/install.sh | bash
+#   curl -fsSL https://punakawan.raprast.asia/install | bash
 #
 set -euo pipefail
 

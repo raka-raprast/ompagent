@@ -2,7 +2,7 @@
 # already on this machine), fetches the bridge, and hands off to the
 # interactive setup wizard.
 #
-#   irm https://raw.githubusercontent.com/raka-raprast/punakawan/main/install.ps1 | iex
+#   irm https://punakawan.raprast.asia/install.ps1 | iex
 #
 # Note: the bridge's background service today is systemd --user (Linux
 # only). On Windows, `setup` still writes ~/.omp-agent/.env and this script
