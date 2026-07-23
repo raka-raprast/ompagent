@@ -66,20 +66,26 @@ systemctl --user restart omp-bridge
   fuzzy matcher. Either way the choice is saved to `~/.omp-agent/.env` so it
   survives a bridge restart.
 - `/model default` — clears the override, back to omp's configured default.
-- `/status` — current model, whether this chat has a run in progress (and for
-  how long), any messages queued behind it, session state, bridge uptime,
-  cron job count, and access mode.
+- `/status` — version + commit, current model, whether this chat has a run
+  in progress (and for how long), any messages queued behind it, session
+  state, bridge uptime, cron job count, and access mode.
 - `/stop` — kills the in-flight omp process for this chat and drops any
   messages still queued behind it. No-op (reports so) if nothing is running.
 - `/update` — `git pull --ff-only` in the bridge's own checkout; if that
-  actually moved `HEAD`, shows the pulled commits and restarts the service
-  (via a detached `systemd-run` timer, so the restart doesn't cut off its
-  own confirmation message) a few seconds later so you're running the new
-  code. Reports "already up to date" if there was nothing to pull, and
-  surfaces the raw git error (e.g. local changes in the way) without
-  restarting if the pull fails. No systemd on this host? It still pulls,
-  but tells you to restart manually. Override the checkout path with
-  `OMP_BRIDGE_REPO_DIR` (default: the directory `bridge.py` lives in).
+  actually moved `HEAD`, shows the version/commit change (e.g. `0.7.0
+  (b0d593e) → 0.8.0 (a1b2c3d)`, or just the commit range if `VERSION` didn't
+  change) and restarts the service (via a detached `systemd-run` timer, so
+  the restart doesn't cut off its own confirmation message) a few seconds
+  later so you're running the new code. Reports "already up to date" if
+  there was nothing to pull, and surfaces the raw git error (e.g. local
+  changes in the way) without restarting if the pull fails. No systemd on
+  this host? It still pulls, but tells you to restart manually. Override
+  the checkout path with `OMP_BRIDGE_REPO_DIR` (default: the directory
+  `bridge.py` lives in).
+
+  Versioning is a plain `VERSION` file at the repo root (e.g. `0.8.0`) —
+  bump it by hand in whatever commit warrants a new version; `/status` and
+  `/update` just read it back.
 - `/help` — lists commands. Anything else is sent straight to omp.
 
 ## Cron jobs

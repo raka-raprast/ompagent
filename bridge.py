@@ -368,6 +368,7 @@ def _format_duration(seconds: float) -> str:
 
 def status_text(chat_id) -> str:
     lines = ["\U0001f4ca Status", ""]
+    lines.append(f"Version: {_bridge_version()} ({_bridge_commit()})")
     lines.append(f"Model: {MODEL or '(omp config default)'}")
 
     info = active_run_info(chat_id)
@@ -408,6 +409,20 @@ REPO_DIR = Path(os.environ.get("OMP_BRIDGE_REPO_DIR", str(Path(__file__).resolve
 UPDATE_RESTART_DELAY = 5  # seconds; long enough for the confirmation message to land first
 
 
+def _bridge_version() -> str:
+    """Read the VERSION file from REPO_DIR. 'unknown' if missing/unreadable —
+    e.g. a checkout predating this file, or REPO_DIR misconfigured."""
+    try:
+        return (REPO_DIR / "VERSION").read_text().strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def _bridge_commit() -> str:
+    rc, out = _run_git(["rev-parse", "--short", "HEAD"])
+    return out if rc == 0 else "unknown"
+
+
 def _run_git(args: list, timeout: int = 30) -> tuple:
     """Run a git command in REPO_DIR. Returns (returncode, combined stdout+stderr)."""
     try:
@@ -429,6 +444,7 @@ def update_bridge(chat_id) -> None:
     if rc != 0:
         send(chat_id, f"⚠️ git rev-parse failed:\n{before}")
         return
+    before_version = _bridge_version()
 
     rc, pull_out = _run_git(["pull", "--ff-only"])
     if rc != 0:
@@ -441,11 +457,17 @@ def update_bridge(chat_id) -> None:
         return
 
     if after == before:
-        send(chat_id, f"✅ Already up to date ({before[:7]}).")
+        send(chat_id, f"✅ Already up to date ({before_version}, {before[:7]}).")
         return
 
+    after_version = _bridge_version()  # re-read: the pull may have changed VERSION itself
+    if after_version != before_version:
+        version_line = f"{before_version} ({before[:7]}) \u2192 {after_version} ({after[:7]})"
+    else:
+        version_line = f"{after_version} ({before[:7]} \u2192 {after[:7]})"
+
     _, log_out = _run_git(["log", "--oneline", f"{before}..{after}"])
-    lines = [f"⬆️ Updated {before[:7]} \u2192 {after[:7]}:", log_out]
+    lines = [f"⬆️ Updated {version_line}:", log_out]
 
     if not shutil.which("systemctl"):
         lines.append("\n⚠️ No systemd found — restart manually to load the new code (python3 bridge.py).")
