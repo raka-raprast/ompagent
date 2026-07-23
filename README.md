@@ -66,6 +66,11 @@ systemctl --user restart omp-bridge
   fuzzy matcher. Either way the choice is saved to `~/.omp-agent/.env` so it
   survives a bridge restart.
 - `/model default` — clears the override, back to omp's configured default.
+- `/status` — current model, whether this chat has a run in progress (and for
+  how long), any messages queued behind it, session state, bridge uptime,
+  cron job count, and access mode.
+- `/stop` — kills the in-flight omp process for this chat and drops any
+  messages still queued behind it. No-op (reports so) if nothing is running.
 - `/help` — lists commands. Anything else is sent straight to omp.
 
 ## Cron jobs

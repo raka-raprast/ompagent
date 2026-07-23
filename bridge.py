@@ -90,6 +90,7 @@ CRON_STATE_FILE: Path = HOME / "cron_state.json"
 CRON_JOBS: list = []
 
 TG_LIMIT = 4096  # Telegram max message length
+_STARTED_AT = time.monotonic()  # process start, for /status uptime
 
 
 def configure() -> None:
@@ -254,8 +255,12 @@ def run_omp(chat_id, message: str) -> str:
     except OSError as e:
         return f"⚠️ failed to start omp: {e}"
 
-
+    key = str(chat_id)
     start = time.monotonic()
+    entry = {"proc": proc, "started": start, "stopped": False, "message": message[:80]}
+    with _active_lock:
+        _active_procs[key] = entry
+
     deadline = start + TIMEOUT
     next_heartbeat = start + HEARTBEAT if HEARTBEAT > 0 else None
     try:
@@ -284,11 +289,102 @@ def run_omp(chat_id, message: str) -> str:
         _kill_process_group(proc)
         proc.communicate()
         raise
+    finally:
+        with _active_lock:
+            _active_procs.pop(key, None)
+
+    if entry["stopped"]:
+        return "🛑 Stopped."
 
     out = stdout.decode(errors="replace").strip()
     if proc.returncode != 0 and not out:
         return f"⚠️ omp exited {proc.returncode} with no output."
     return out or "(omp produced no output)"
+
+
+# ── Active-run tracking (for /status, /stop) ─────────────────────────────────
+
+_active_procs: dict = {}
+_active_lock = threading.Lock()
+
+
+def stop_run(chat_id) -> tuple:
+    """Kill the in-flight omp process for `chat_id` (if any) and drop any
+    messages still queued behind it. Returns (was_running, dropped_count).
+    """
+    key = str(chat_id)
+    with _active_lock:
+        entry = _active_procs.get(key)
+        if entry is not None:
+            entry["stopped"] = True
+    if entry is not None:
+        _kill_process_group(entry["proc"])
+
+    with _workers_lock:
+        q = _workers.get(chat_id)
+    dropped = 0
+    if q is not None:
+        while True:
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                break
+            q.task_done()
+            dropped += 1
+    return entry is not None, dropped
+
+
+def active_run_info(chat_id) -> dict | None:
+    """Return {"started", "message"} for the in-flight run on this chat, or None."""
+    with _active_lock:
+        entry = _active_procs.get(str(chat_id))
+        if entry is None:
+            return None
+        return {"started": entry["started"], "message": entry["message"]}
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, s = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {s}s"
+    hours, m = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {m}m"
+    days, h = divmod(hours, 24)
+    return f"{days}d {h}h"
+
+
+def status_text(chat_id) -> str:
+    lines = ["\U0001f4ca Status", ""]
+    lines.append(f"Model: {MODEL or '(omp config default)'}")
+
+    info = active_run_info(chat_id)
+    if info:
+        elapsed = int(time.monotonic() - info["started"])
+        lines.append(f"This chat: running for {elapsed}s \u2014 \u201c{info['message']}\u201d")
+    else:
+        lines.append("This chat: idle")
+
+    sdir = session_dir(chat_id)
+    lines.append(
+        "Session: in progress" if has_session(sdir) else "Session: none yet (next message starts fresh)"
+    )
+
+    with _workers_lock:
+        q = _workers.get(chat_id)
+    queued = q.qsize() if q is not None else 0
+    if queued:
+        lines.append(f"Queued: {queued} message(s) waiting")
+
+    lines.append(f"Bridge uptime: {_format_duration(time.monotonic() - _STARTED_AT)}")
+    lines.append(f"omp: {OMP_BIN}")
+    lines.append(f"Cron jobs: {len(CRON_JOBS)} loaded" if CRON_JOBS else "Cron jobs: none configured")
+    lines.append("Access: everyone (OMP_BRIDGE_ALLOWED=*)" if ALLOW_ALL else f"Access: {len(ALLOWED)} allowed chat(s)")
+
+    return "\n".join(lines)
 
 
 # ── Model catalog & picker ───────────────────────────────────────────────────
@@ -838,7 +934,7 @@ def handle_message(msg: dict) -> None:
     if text.startswith("/"):
         cmd = text.split()[0].lstrip("/").split("@")[0].lower()
         if cmd == "start":
-            send(chat_id, "🤖 omp bridge online. Send a message and I'll run it through omp. /reset clears our conversation, /model shows or changes the model.")
+            send(chat_id, "🤖 omp bridge online. Send a message and I'll run it through omp. /reset clears our conversation, /model shows or changes the model, /status shows what's running, /stop cancels it.")
             return
         if cmd == "reset":
             sdir = session_dir(chat_id)
@@ -871,8 +967,22 @@ def handle_message(msg: dict) -> None:
             set_model(arg)
             send(chat_id, f"✅ Model set to {MODEL} (not found in the connected catalog — passed through as-is). Verify with /model.")
             return
+        if cmd == "status":
+            send(chat_id, status_text(chat_id))
+            return
+        if cmd == "stop":
+            stopped, dropped = stop_run(chat_id)
+            if stopped and dropped:
+                send(chat_id, f"🛑 Stopping the current run and dropped {dropped} queued message(s).")
+            elif stopped:
+                send(chat_id, "🛑 Stopping the current run...")
+            elif dropped:
+                send(chat_id, f"🛑 Dropped {dropped} queued message(s) (nothing was actively running).")
+            else:
+                send(chat_id, "Nothing is running right now.")
+            return
         if cmd == "help":
-            send(chat_id, "Commands: /start, /reset (new conversation), /model [name] (show/change model), /help. Anything else is sent to omp.")
+            send(chat_id, "Commands: /start, /reset (new conversation), /model [name] (show/change model), /status (what's running), /stop (cancel the current run), /help. Anything else is sent to omp.")
             return
         # Unknown slash command -> pass through to omp as normal text.
 
