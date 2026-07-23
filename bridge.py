@@ -41,6 +41,8 @@ Config is read from the environment first, then from ~/.omp-agent/.env
   OMP_BRIDGE_CRON_FILE   Scheduled-job definitions (default: ~/.omp-agent/cron.json).
                          Absent file = no cron jobs. See the "Cron scheduler"
                          section below for the job format.
+  OMP_BRIDGE_REPO_DIR    Git checkout to pull in from Telegram via /update.
+                         Default: the directory this script lives in.
 """
 
 import json
@@ -392,6 +394,86 @@ def status_text(chat_id) -> str:
     lines.append("Access: everyone (OMP_BRIDGE_ALLOWED=*)" if ALLOW_ALL else f"Access: {len(ALLOWED)} allowed chat(s)")
 
     return "\n".join(lines)
+
+
+# ── Self-update ───────────────────────────────────────────────────────────────
+#
+# /update pulls the latest commit from git and, if anything actually changed,
+# schedules a *deferred* restart via a detached `systemd-run` timer instead of
+# restarting inline. Restarting inline would `systemctl restart` the very
+# cgroup this process lives in, killing the handler (and its own confirmation
+# reply) before it could ever be sent.
+
+REPO_DIR = Path(os.environ.get("OMP_BRIDGE_REPO_DIR", str(Path(__file__).resolve().parent)))
+UPDATE_RESTART_DELAY = 5  # seconds; long enough for the confirmation message to land first
+
+
+def _run_git(args: list, timeout: int = 30) -> tuple:
+    """Run a git command in REPO_DIR. Returns (returncode, combined stdout+stderr)."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(REPO_DIR), *args], capture_output=True, text=True, timeout=timeout
+        )
+    except Exception as e:  # noqa: BLE001
+        return 1, f"failed to run git: {e}"
+    return proc.returncode, (proc.stdout + proc.stderr).strip()
+
+
+def update_bridge(chat_id) -> None:
+    """Pull the latest bridge code and, if it changed, schedule a restart."""
+    if not (REPO_DIR / ".git").exists():
+        send(chat_id, f"⚠️ {REPO_DIR} isn't a git checkout — can't self-update. Set OMP_BRIDGE_REPO_DIR.")
+        return
+
+    rc, before = _run_git(["rev-parse", "HEAD"])
+    if rc != 0:
+        send(chat_id, f"⚠️ git rev-parse failed:\n{before}")
+        return
+
+    rc, pull_out = _run_git(["pull", "--ff-only"])
+    if rc != 0:
+        send(chat_id, f"⚠️ git pull failed:\n{pull_out}")
+        return
+
+    rc, after = _run_git(["rev-parse", "HEAD"])
+    if rc != 0:
+        send(chat_id, f"⚠️ git rev-parse failed:\n{after}")
+        return
+
+    if after == before:
+        send(chat_id, f"✅ Already up to date ({before[:7]}).")
+        return
+
+    _, log_out = _run_git(["log", "--oneline", f"{before}..{after}"])
+    lines = [f"⬆️ Updated {before[:7]} \u2192 {after[:7]}:", log_out]
+
+    if not shutil.which("systemctl"):
+        lines.append("\n⚠️ No systemd found — restart manually to load the new code (python3 bridge.py).")
+        send(chat_id, "\n".join(lines))
+        return
+
+    with _active_lock:
+        active_count = len(_active_procs)
+    if active_count:
+        lines.append(f"\n⚠️ {active_count} run(s) in progress (this chat or others) will be interrupted.")
+
+    lines.append(f"\nRestarting in {UPDATE_RESTART_DELAY}s to load the new code — give it a few seconds, then say hi.")
+    send(chat_id, "\n".join(lines))
+
+    unit = f"omp-bridge-update-{int(time.time())}"
+    try:
+        subprocess.run(
+            [
+                "systemd-run", "--user",
+                f"--on-active={UPDATE_RESTART_DELAY}s",
+                f"--unit={unit}",
+                "--description=omp-bridge self-update restart",
+                "systemctl", "--user", "restart", "omp-bridge",
+            ],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception as e:  # noqa: BLE001
+        send(chat_id, f"⚠️ pulled the update but couldn't schedule the restart: {e}\nRestart manually.")
 
 
 # ── Model catalog & picker ───────────────────────────────────────────────────
@@ -988,8 +1070,11 @@ def handle_message(msg: dict) -> None:
             else:
                 send(chat_id, "Nothing is running right now.")
             return
+        if cmd == "update":
+            update_bridge(chat_id)
+            return
         if cmd == "help":
-            send(chat_id, "Commands: /start, /reset (new conversation), /model [name] (show/change model), /status (what's running), /stop (cancel the current run), /help. Anything else is sent to omp.")
+            send(chat_id, "Commands: /start, /reset (new conversation), /model [name] (show/change model), /status (what's running), /stop (cancel the current run), /update (pull + restart), /help. Anything else is sent to omp.")
             return
         # Unknown slash command -> pass through to omp as normal text.
 

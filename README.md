@@ -71,6 +71,15 @@ systemctl --user restart omp-bridge
   cron job count, and access mode.
 - `/stop` — kills the in-flight omp process for this chat and drops any
   messages still queued behind it. No-op (reports so) if nothing is running.
+- `/update` — `git pull --ff-only` in the bridge's own checkout; if that
+  actually moved `HEAD`, shows the pulled commits and restarts the service
+  (via a detached `systemd-run` timer, so the restart doesn't cut off its
+  own confirmation message) a few seconds later so you're running the new
+  code. Reports "already up to date" if there was nothing to pull, and
+  surfaces the raw git error (e.g. local changes in the way) without
+  restarting if the pull fails. No systemd on this host? It still pulls,
+  but tells you to restart manually. Override the checkout path with
+  `OMP_BRIDGE_REPO_DIR` (default: the directory `bridge.py` lives in).
 - `/help` — lists commands. Anything else is sent straight to omp.
 
 ## Cron jobs
@@ -136,6 +145,7 @@ take precedence.
 | `OMP_BRIDGE_HEARTBEAT_TEXT` | no  | see below                 | Heartbeat message template; `{elapsed}` is replaced with seconds waited. |
 | `OMP_BIN`              | no       | resolved from `PATH`      | Path to the `omp` binary. |
 | `OMP_BRIDGE_CRON_FILE` | no       | `~/.omp-agent/cron.json`  | Scheduled-job definitions; see [Cron jobs](#cron-jobs). |
+| `OMP_BRIDGE_REPO_DIR`  | no       | dir containing `bridge.py` | Git checkout `/update` pulls in. |
 
 ## Security
 
