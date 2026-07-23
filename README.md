@@ -25,7 +25,12 @@ runs the setup wizard, which:
 4. Writes config to `~/.omp-agent/.env`.
 5. On Linux, offers to install a `systemd --user` service so the bridge
    survives reboots — no `sudo` required (it also tries `loginctl
-   enable-linger` so it keeps running after you log out).
+   enable-linger` so it keeps running after you log out). Installing the
+   service deploys a validated *copy* of the checkout to
+   `~/.omp-agent/release` and points `ExecStart` there, never at the
+   checkout itself — that way hand-editing `bridge.py` in your working
+   copy can never break the running bot; only `/update` (or re-running
+   `setup`) redeploys it, and only after a byte-compile check passes.
 
 Already have a checkout? Run the wizard directly:
 
@@ -71,17 +76,26 @@ systemctl --user restart omp-bridge
   state, bridge uptime, cron job count, and access mode.
 - `/stop` — kills the in-flight omp process for this chat and drops any
   messages still queued behind it. No-op (reports so) if nothing is running.
-- `/update` — `git pull --ff-only` in the bridge's own checkout; if that
-  actually moved `HEAD`, shows the version/commit change (e.g. `0.7.0
-  (b0d593e) → 0.8.0 (a1b2c3d)`, or just the commit range if `VERSION` didn't
-  change) and restarts the service (via a detached `systemd-run` timer, so
-  the restart doesn't cut off its own confirmation message) a few seconds
-  later so you're running the new code. Reports "already up to date" if
-  there was nothing to pull, and surfaces the raw git error (e.g. local
-  changes in the way) without restarting if the pull fails. No systemd on
-  this host? It still pulls, but tells you to restart manually. Override
-  the checkout path with `OMP_BRIDGE_REPO_DIR` (default: the directory
-  `bridge.py` lives in).
+- `/update` — `git pull --ff-only` in `OMP_BRIDGE_REPO_DIR` (the checkout,
+  default: the directory `bridge.py` lives in); if that actually moved
+  `HEAD`, byte-compiles the pulled code and — only if that passes — deploys
+  it to `~/.omp-agent/release` (the directory the service actually runs
+  from; see [Installation](#installation)) and restarts the service (via a
+  detached `systemd-run` timer, so the restart doesn't cut off its own
+  confirmation message) a few seconds later. Shows the version/commit
+  change (e.g. `0.7.0 (b0d593e) → 0.8.0 (a1b2c3d)`, or just the commit range
+  if `VERSION` didn't change). A commit that fails to compile is rolled
+  back (`git reset --hard`) instead of ever reaching the running service.
+  Reports "already up to date" if there was nothing to pull, and surfaces
+  the raw git error (e.g. local changes in the way) without restarting if
+  the pull fails. No systemd on this host? It still pulls and validates,
+  but tells you to restart manually.
+
+  If systemd's own restart budget is exhausted (`StartLimitBurst` in
+  `omp-bridge.service` — 6 failures within 120s by default), it gives up
+  instead of looping forever, which fires `omp-bridge-alert.service` and
+  messages every allowed chat directly via the Telegram API that the bot is
+  down and needs a look (`journalctl --user -u omp-bridge`).
 
   Versioning is a plain `VERSION` file at the repo root (e.g. `0.8.0`) —
   bump it by hand in whatever commit warrants a new version; `/status` and
@@ -151,7 +165,7 @@ take precedence.
 | `OMP_BRIDGE_HEARTBEAT_TEXT` | no  | see below                 | Heartbeat message template; `{elapsed}` is replaced with seconds waited. |
 | `OMP_BIN`              | no       | resolved from `PATH`      | Path to the `omp` binary. |
 | `OMP_BRIDGE_CRON_FILE` | no       | `~/.omp-agent/cron.json`  | Scheduled-job definitions; see [Cron jobs](#cron-jobs). |
-| `OMP_BRIDGE_REPO_DIR`  | no       | dir containing `bridge.py` | Git checkout `/update` pulls in. |
+| `OMP_BRIDGE_REPO_DIR`  | no       | dir containing `bridge.py` | Git checkout `/update` pulls in; set automatically by `setup` to the checkout it ran from. Distinct from `~/.omp-agent/release`, the dir the service actually runs from. |
 
 ## Security
 

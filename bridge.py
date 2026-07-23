@@ -15,6 +15,16 @@ Setup:
                                 Writes ~/.omp-agent/.env.
   python3 bridge.py            Run the bridge in the foreground.
 
+Deploys:
+  `setup` copies this checkout into ~/.omp-agent/release and points the
+  systemd unit there, never at the checkout itself — hand-edits or a mid-pull
+  checkout are never what's live. /update re-pulls the checkout named by
+  OMP_BRIDGE_REPO_DIR, byte-compiles it, and only then re-deploys the copy
+  and restarts; a bad pull is rejected (and rolled back) before it can take
+  the bot down. Only when systemd itself gives up (see StartLimitBurst in
+  the unit) does the omp-bridge-alert.service fire and message you on
+  Telegram that the bot is down.
+
 Config is read from the environment first, then from ~/.omp-agent/.env
 (override the directory with OMP_AGENT_HOME):
   TELEGRAM_BOT_TOKEN     Bot token from @BotFather. Required.
@@ -41,13 +51,15 @@ Config is read from the environment first, then from ~/.omp-agent/.env
   OMP_BRIDGE_CRON_FILE   Scheduled-job definitions (default: ~/.omp-agent/cron.json).
                          Absent file = no cron jobs. See the "Cron scheduler"
                          section below for the job format.
-  OMP_BRIDGE_REPO_DIR    Git checkout to pull in from Telegram via /update.
-                         Default: the directory this script lives in.
+  OMP_BRIDGE_REPO_DIR    Git checkout to pull from via /update. Default: the
+                         directory this script lives in (fine if you don't
+                         separate dev/prod; see "Deploys" below if you do).
 """
 
 import json
 import os
 import queue
+import secrets
 import shutil
 import signal
 import subprocess
@@ -87,6 +99,7 @@ MODEL = ""
 HOME: Path = AGENT_HOME / "data"
 SESSIONS: Path = HOME / "sessions"
 WORKSPACE: Path = HOME / "workspace"
+MEDIA_DIR: Path = HOME / "media"
 TIMEOUT = 600
 HEARTBEAT_FIRST = 180     # seconds before the first "still working" nudge; 0 disables entirely
 HEARTBEAT_INTERVAL = 120  # seconds between subsequent nudges; 0 = first one only
@@ -102,7 +115,7 @@ _STARTED_AT = time.monotonic()  # process start, for /status uptime
 
 def configure() -> None:
     """Load run-mode config from the environment. Called once, before main()."""
-    global TOKEN, ALLOW_ALL, ALLOWED, MODEL, HOME, SESSIONS, WORKSPACE, TIMEOUT, OMP_BIN
+    global TOKEN, ALLOW_ALL, ALLOWED, MODEL, HOME, SESSIONS, WORKSPACE, MEDIA_DIR, TIMEOUT, OMP_BIN
     global HEARTBEAT_FIRST, HEARTBEAT_INTERVAL, HEARTBEAT_TEXT
     global CRON_FILE, CRON_STATE_FILE, CRON_JOBS
 
@@ -120,6 +133,7 @@ def configure() -> None:
     HOME = Path(os.environ.get("OMP_BRIDGE_HOME", str(AGENT_HOME / "data")))
     SESSIONS = HOME / "sessions"
     WORKSPACE = HOME / "workspace"
+    MEDIA_DIR = HOME / "media"
     TIMEOUT = int(os.environ.get("OMP_BRIDGE_TIMEOUT", "600"))
     HEARTBEAT_FIRST = int(os.environ.get("OMP_BRIDGE_HEARTBEAT_FIRST", "180"))
     HEARTBEAT_INTERVAL = int(os.environ.get("OMP_BRIDGE_HEARTBEAT_INTERVAL", "120"))
@@ -129,6 +143,7 @@ def configure() -> None:
 
     SESSIONS.mkdir(parents=True, exist_ok=True)
     WORKSPACE.mkdir(parents=True, exist_ok=True)
+    MEDIA_DIR.mkdir(parents=True, exist_ok=True)
     CRON_STATE_FILE = HOME / "cron_state.json"
     CRON_JOBS = _load_cron_jobs(CRON_FILE)
 
@@ -185,6 +200,40 @@ def send(chat_id, text: str) -> None:
     text = text.strip() or "(empty response)"
     for i in range(0, len(text), TG_LIMIT):
         api("sendMessage", {"chat_id": chat_id, "text": text[i : i + TG_LIMIT]})
+
+
+_IMAGE_MIME_EXT = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/bmp": ".bmp",
+}
+
+
+def download_telegram_file(file_id: str) -> bytes | None:
+    """Download a Telegram-hosted file's raw bytes via getFile + the file API."""
+    info = api("getFile", {"file_id": file_id})
+    if not info.get("ok"):
+        print(f"[bridge] getFile failed: {info.get('description') or info.get('error')}", flush=True)
+        return None
+    file_path = info["result"]["file_path"]
+    url = f"https://api.telegram.org/file/bot{TOKEN}/{file_path}"
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            return resp.read()
+    except Exception as e:  # noqa: BLE001
+        print(f"[bridge] file download failed: {e}", flush=True)
+        return None
+
+
+def save_chat_media(chat_id, data: bytes, suffix: str) -> Path:
+    """Persist downloaded media under a per-chat directory; returns the absolute path."""
+    d = MEDIA_DIR / str(chat_id)
+    d.mkdir(parents=True, exist_ok=True)
+    path = d / f"{int(time.time() * 1000)}-{secrets.token_hex(4)}{suffix}"
+    path.write_bytes(data)
+    return path
 
 
 TYPING_REFRESH = 4  # seconds; Telegram's "typing…" indicator fades after ~5s unread
@@ -248,13 +297,15 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
         pass
 
 
-def run_omp(chat_id, message: str) -> str:
+def run_omp(chat_id, message: str, attachments: list | None = None) -> str:
     sdir = session_dir(chat_id)
     cmd = [OMP_BIN, "-p", "--session-dir", str(sdir), "--auto-approve", "--cwd", str(WORKSPACE)]
     if has_session(sdir):
         cmd.append("--continue")
     if MODEL:
         cmd += ["--model", MODEL]
+    for path in attachments or []:
+        cmd.append(f"@{path}")
     cmd.append(message)
 
     try:
@@ -406,7 +457,38 @@ def status_text(chat_id) -> str:
 # reply) before it could ever be sent.
 
 REPO_DIR = Path(os.environ.get("OMP_BRIDGE_REPO_DIR", str(Path(__file__).resolve().parent)))
+# Wherever this running process's own bridge.py actually lives — the systemd
+# ExecStart target. When dev/prod are separated this is ~/.omp-agent/release,
+# distinct from REPO_DIR (the git checkout); when they're not, it's the same
+# directory and _deploy() below becomes a no-op.
+RELEASE_DIR = Path(__file__).resolve().parent
 UPDATE_RESTART_DELAY = 5  # seconds; long enough for the confirmation message to land first
+
+
+def _validate_source(src: Path) -> tuple:
+    """Byte-compile every .py in src. A pulled commit that doesn't even parse
+    must be rejected here, never handed to the live service to crash on."""
+    py_files = sorted(str(p) for p in src.glob("*.py"))
+    if not py_files:
+        return False, f"no .py files found in {src}"
+    proc = subprocess.run(
+        [sys.executable, "-m", "py_compile", *py_files],
+        capture_output=True, text=True, timeout=30,
+    )
+    if proc.returncode != 0:
+        return False, (proc.stdout + proc.stderr).strip()
+    return True, ""
+
+
+def _deploy(src: Path, dst: Path) -> None:
+    """Atomically mirror src into dst (the systemd-managed release dir)."""
+    tmp = dst.with_name(dst.name + ".new")
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    shutil.copytree(src, tmp, ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc"))
+    if dst.exists():
+        shutil.rmtree(dst)
+    tmp.rename(dst)
 
 
 def _bridge_version() -> str:
@@ -459,6 +541,20 @@ def update_bridge(chat_id) -> None:
     if after == before:
         send(chat_id, f"✅ Already up to date ({before_version}, {before[:7]}).")
         return
+
+    ok, err = _validate_source(REPO_DIR)
+    if not ok:
+        _run_git(["reset", "--hard", before])  # don't leave the checkout on broken code
+        send(chat_id, f"⚠️ pulled {after[:7]} but it fails to compile — rolled back to {before[:7]}:\n{err}")
+        return
+
+    if RELEASE_DIR != REPO_DIR:
+        try:
+            _deploy(REPO_DIR, RELEASE_DIR)
+        except Exception as e:  # noqa: BLE001
+            _run_git(["reset", "--hard", before])
+            send(chat_id, f"⚠️ pulled {after[:7]} but deploying it to {RELEASE_DIR} failed — rolled back to {before[:7]}:\n{e}")
+            return
 
     after_version = _bridge_version()  # re-read: the pull may have changed VERSION itself
     if after_version != before_version:
@@ -1003,9 +1099,9 @@ _workers_lock = threading.Lock()
 
 def _worker_loop(chat_id, q: "queue.Queue") -> None:
     while True:
-        message = q.get()
+        message, attachments = q.get()
         try:
-            reply = run_omp(chat_id, message)
+            reply = run_omp(chat_id, message, attachments)
             send(chat_id, reply)
         except Exception as e:  # noqa: BLE001
             send(chat_id, f"⚠️ bridge error: {e}")
@@ -1013,14 +1109,14 @@ def _worker_loop(chat_id, q: "queue.Queue") -> None:
             q.task_done()
 
 
-def enqueue(chat_id, message: str) -> None:
+def enqueue(chat_id, message: str, attachments: list | None = None) -> None:
     with _workers_lock:
         q = _workers.get(chat_id)
         if q is None:
             q = queue.Queue()
             _workers[chat_id] = q
             threading.Thread(target=_worker_loop, args=(chat_id, q), daemon=True).start()
-    q.put(message)
+    q.put((message, attachments or []))
 
 
 # ── Message handling ─────────────────────────────────────────────────────────
@@ -1033,8 +1129,18 @@ def authorized(chat_id) -> bool:
 def handle_message(msg: dict) -> None:
     chat = msg.get("chat", {})
     chat_id = chat.get("id")
-    text = (msg.get("text") or "").strip()
-    if chat_id is None or not text:
+    if chat_id is None:
+        return
+
+    text = (msg.get("text") or msg.get("caption") or "").strip()
+    attachments: list[str] = []
+    photo = msg.get("photo")
+    document = msg.get("document")
+    image_document = (
+        document if document and (document.get("mime_type") or "").startswith("image/") else None
+    )
+
+    if not text and not photo and not image_document:
         return
 
     if not authorized(chat_id):
@@ -1042,7 +1148,21 @@ def handle_message(msg: dict) -> None:
         print(f"[bridge] denied chat {chat_id}", flush=True)
         return
 
-    if text.startswith("/"):
+    if photo or image_document:
+        if photo:
+            file_id, suffix = photo[-1]["file_id"], ".jpg"
+        else:
+            file_id = image_document["file_id"]
+            name_ext = Path(image_document.get("file_name", "")).suffix
+            suffix = name_ext or _IMAGE_MIME_EXT.get(image_document.get("mime_type", ""), ".jpg")
+        data = download_telegram_file(file_id)
+        if data is None:
+            send(chat_id, "⚠️ Couldn't download your image. Please try sending it again.")
+            return
+        attachments.append(str(save_chat_media(chat_id, data, suffix)))
+        if not text:
+            text = "Take a look at the attached image and tell me what you see."
+    if not attachments and text.startswith("/"):
         cmd = text.split()[0].lstrip("/").split("@")[0].lower()
         if cmd == "start":
             send(chat_id, "🤖 omp bridge online. Send a message and I'll run it through omp. /reset clears our conversation, /model shows or changes the model, /status shows what's running, /stop cancels it.")
@@ -1100,9 +1220,9 @@ def handle_message(msg: dict) -> None:
             return
         # Unknown slash command -> pass through to omp as normal text.
 
-    print(f"[bridge] chat {chat_id}: {text[:80]!r}", flush=True)
-    enqueue(chat_id, text)
-
+    note = f" [+{len(attachments)} image]" if attachments else ""
+    print(f"[bridge] chat {chat_id}: {text[:80]!r}{note}", flush=True)
+    enqueue(chat_id, text, attachments)
 
 # ── Long-poll loop ────────────────────────────────────────────────────────────
 
@@ -1170,25 +1290,59 @@ def _autodetect_chat_id(token: str) -> str:
 
 
 def _install_user_service() -> None:
+    source_dir = Path(__file__).resolve().parent
+    release_dir = AGENT_HOME / "release"
+
+    ok, err = _validate_source(source_dir)
+    if not ok:
+        print(f"  ✗ {source_dir} fails to compile, refusing to install a service on top of it:\n{err}")
+        return
+
+    if release_dir != source_dir:
+        _deploy(source_dir, release_dir)
+        exec_target = release_dir / "bridge.py"
+        print(f"  ✓ deployed {source_dir} -> {release_dir}")
+    else:
+        exec_target = source_dir / "bridge.py"
+
     unit_dir = Path.home() / ".config" / "systemd" / "user"
     unit_dir.mkdir(parents=True, exist_ok=True)
+
     unit_path = unit_dir / "omp-bridge.service"
     unit_path.write_text(
         "[Unit]\n"
         "Description=omp <-> Telegram bridge\n"
         "After=network-online.target\n"
         "Wants=network-online.target\n"
+        # After this many failures inside the interval, systemd stops retrying
+        # and marks the unit failed instead of restarting forever — that's
+        # what lets OnFailure= below ever fire.
+        "StartLimitIntervalSec=120\n"
+        "StartLimitBurst=6\n"
+        "OnFailure=omp-bridge-alert.service\n"
         "\n"
         "[Service]\n"
         "Type=simple\n"
         f"EnvironmentFile={ENV_FILE}\n"
-        f"ExecStart={sys.executable} {Path(__file__).resolve()}\n"
+        f"ExecStart={sys.executable} {exec_target}\n"
         "Restart=always\n"
         "RestartSec=3\n"
         "\n"
         "[Install]\n"
         "WantedBy=default.target\n"
     )
+
+    alert_path = unit_dir / "omp-bridge-alert.service"
+    alert_path.write_text(
+        "[Unit]\n"
+        "Description=omp-bridge crash-loop notifier\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"EnvironmentFile={ENV_FILE}\n"
+        f"ExecStart=/usr/bin/env bash {exec_target.parent / 'notify_failure.sh'}\n"
+    )
+
     subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
     subprocess.run(["systemctl", "--user", "enable", "--now", "omp-bridge.service"], check=False)
     print(f"  ✓ installed + started {unit_path}")
@@ -1242,6 +1396,7 @@ def setup_wizard() -> None:
         f"OMP_BRIDGE_HOME={home}\n"
         f"OMP_BRIDGE_TIMEOUT={timeout}\n"
         f"OMP_BIN={omp_bin}\n"
+        f"OMP_BRIDGE_REPO_DIR={Path(__file__).resolve().parent}\n"
     )
     ENV_FILE.chmod(0o600)
     print(f"\n✓ wrote {ENV_FILE}")
