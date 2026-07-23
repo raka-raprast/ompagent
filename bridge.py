@@ -429,6 +429,11 @@ def status_text(chat_id) -> str:
     else:
         lines.append("This chat: idle")
 
+    with _login_lock:
+        login_flow = _login_flows.get(str(chat_id))
+    if login_flow:
+        lines.append(f"This chat: logging in to {login_flow['provider']['name']}")
+
     sdir = session_dir(chat_id)
     lines.append(
         "Session: in progress" if has_session(sdir) else "Session: none yet (next message starts fresh)"
@@ -825,15 +830,27 @@ def handle_callback_query(cq: dict) -> None:
         answer_callback(cq_id, "\u26d4 Not authorized.")
         return
 
+    key = str(chat_id)
+
     if data == "mx:noop":
         answer_callback(cq_id)
         return
 
-    key = str(chat_id)
+    if data in ("lc:yes", "lc:no"):
+        with _login_lock:
+            flow = _login_flows.get(key)
+        if flow is None or flow.get("awaiting") != "confirm":
+            answer_callback(cq_id, "No pending confirmation.")
+            return
+        flow["answers"].put(data == "lc:yes")
+        edit_message(chat_id, message_id, "\u2753 " + ("Yes" if data == "lc:yes" else "No"), {"inline_keyboard": []})
+        answer_callback(cq_id)
+        return
+
     with _picker_lock:
         session = _picker_sessions.get(key)
     if session is None:
-        answer_callback(cq_id, "Picker expired \u2014 use /model again.")
+        answer_callback(cq_id, "Picker expired \u2014 use /model or /login again.")
         return
 
     if data == "mx":
@@ -933,7 +950,365 @@ def handle_callback_query(cq: dict) -> None:
         answer_callback(cq_id, "Model switched!")
         return
 
+    if data == "lx:noop":
+        answer_callback(cq_id)
+        return
+
+    if data == "lx":
+        with _picker_lock:
+            _picker_sessions.pop(key, None)
+        edit_message(chat_id, message_id, "Login cancelled.", {"inline_keyboard": []})
+        answer_callback(cq_id)
+        return
+
+    if data.startswith("lg:"):
+        if not session.get("login"):
+            answer_callback(cq_id)
+            return
+        page = int(data.split(":", 1)[1])
+        session["page"] = page
+        keyboard, _page, _total_pages = build_login_keyboard(session["providers"], page)
+        edit_message(chat_id, message_id, session.get("header", _login_header()), keyboard)
+        answer_callback(cq_id)
+        return
+
+    if data.startswith("lp:"):
+        if not session.get("login"):
+            answer_callback(cq_id)
+            return
+        provider_id = data.split(":", 1)[1]
+        provider = next((p for p in session.get("providers", []) if p["id"] == provider_id), None)
+        if provider is None:
+            answer_callback(cq_id, "Provider not found.")
+            return
+        with _picker_lock:
+            _picker_sessions.pop(key, None)
+        edit_message(chat_id, message_id, f"\U0001f510 Starting login to {provider['name']}...", {"inline_keyboard": []})
+        answer_callback(cq_id, "Starting...")
+        start_login(chat_id, provider)
+        return
+
     answer_callback(cq_id)
+
+
+# ── Login ────────────────────────────────────────────────────────────────────
+#
+# /login mirrors omp's own interactive `/login` slash command — OAuth or an
+# API-key paste against one of ~50 providers — which only exists as a TTY
+# flow. `omp --mode rpc` is the one surface built to answer those prompts
+# programmatically: get_login_providers lists them, login/providerId starts
+# one, and whatever it needs back (a URL to open, a value to paste, a
+# yes/no) arrives as extension_ui_request frames this module answers over a
+# background thread for as long as the flow takes — an OAuth round trip can
+# sit for minutes waiting on the user's browser.
+
+LOGIN_PROVIDERS_CACHE_TTL = 300  # seconds
+LOGIN_PAGE_SIZE = 10
+LOGIN_TIMEOUT = 900  # seconds; generous enough for a slow OAuth round trip
+
+_login_providers_cache: dict = {"data": None, "fetched_at": 0.0}
+
+# One entry per chat with a login attempt in flight, keyed by str(chat_id).
+# `answers` is how the Telegram-side handlers (a plain-text reply, a Yes/No
+# button tap) hand a value back to the worker thread blocked inside
+# _handle_login_ui_request. `awaiting` is None, "text", or "confirm".
+_login_flows: dict = {}
+_login_lock = threading.Lock()
+_LOGIN_CANCELLED = object()  # sentinel pushed to `answers` by /stop
+
+
+def _rpc_call(command: dict, timeout: int = 20) -> dict | None:
+    """Run a single command through a one-shot `omp --mode rpc` process: write
+    it, close stdin, collect the matching response frame. Per the RPC docs,
+    omp exits on its own once stdin closes and processing settles."""
+    payload = json.dumps(command) + "\n"
+    try:
+        proc = subprocess.run(
+            [OMP_BIN, "--mode", "rpc", "--no-session", "--cwd", str(WORKSPACE)],
+            input=payload, capture_output=True, text=True, timeout=timeout,
+        )
+        out = proc.stdout
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout or ""
+    except OSError as e:
+        print(f"[bridge] failed to start omp rpc: {e}", flush=True)
+        return None
+    for line in (out or "").splitlines():
+        try:
+            frame = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if frame.get("type") == "response" and frame.get("id") == command.get("id"):
+            return frame
+    return None
+
+
+def get_login_providers(force: bool = False) -> list:
+    """Return the full provider list `/login` can target, caching for
+    LOGIN_PROVIDERS_CACHE_TTL seconds (mirrors get_models()'s caching)."""
+    now = time.monotonic()
+    cached = _login_providers_cache["data"]
+    if cached is not None and not force and (now - _login_providers_cache["fetched_at"]) < LOGIN_PROVIDERS_CACHE_TTL:
+        return cached
+    resp = _rpc_call({"id": "providers", "type": "get_login_providers"})
+    if resp is None or not resp.get("success"):
+        print(f"[bridge] failed to load login providers: {resp}", flush=True)
+        return cached or []
+    providers = resp.get("data", {}).get("providers", [])
+    _login_providers_cache["data"] = providers
+    _login_providers_cache["fetched_at"] = now
+    return providers
+
+
+def search_login_providers(providers: list, query: str) -> list:
+    """Substring match against provider id or display name, case-insensitive."""
+    q = query.strip().lower()
+    if not q:
+        return []
+    matches = [p for p in providers if q in p["id"].lower() or q in p["name"].lower()]
+    matches.sort(key=lambda p: p["name"].lower())
+    return matches
+
+
+def _login_label(p: dict) -> str:
+    label = ("\u2713 " if p.get("authenticated") else "") + p["name"]
+    return label if len(label) <= 42 else label[:39] + "..."
+
+
+def build_login_keyboard(providers: list, page: int = 0) -> tuple:
+    """Paginated, one-button-per-row provider picker (names run long)."""
+    total = len(providers)
+    total_pages = max(1, -(-total // LOGIN_PAGE_SIZE))
+    page = max(0, min(page, total_pages - 1))
+    start = page * LOGIN_PAGE_SIZE
+    chunk = providers[start : start + LOGIN_PAGE_SIZE]
+
+    rows = [[_btn(_login_label(p), f"lp:{p['id']}")] for p in chunk]
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(_btn("\u25c0 Prev", f"lg:{page - 1}"))
+        nav.append(_btn(f"{page + 1}/{total_pages}", "lx:noop"))
+        if page < total_pages - 1:
+            nav.append(_btn("Next \u25b6", f"lg:{page + 1}"))
+        rows.append(nav)
+    rows.append([_btn("\u2717 Cancel", "lx")])
+    return {"inline_keyboard": rows}, page, total_pages
+
+
+def _login_header() -> str:
+    return "\U0001f510 Login\n\nSelect a provider (\u2713 = already logged in):"
+
+
+def send_login_picker(chat_id) -> None:
+    providers = get_login_providers()
+    if not providers:
+        send(chat_id, "\u26a0\ufe0f Couldn't load the login provider list from omp.")
+        return
+    header = _login_header()
+    keyboard, _page, _total_pages = build_login_keyboard(providers, 0)
+    msg_id = send_keyboard(chat_id, header, keyboard)
+    if msg_id is not None:
+        with _picker_lock:
+            _picker_sessions[str(chat_id)] = {"login": True, "providers": providers, "page": 0, "header": header}
+
+
+def send_login_search_results(chat_id, query: str, matches: list) -> None:
+    header = f"\U0001f510 Login\n\n{len(matches)} provider(s) match '{query}'\nSelect one:"
+    keyboard, _page, _total_pages = build_login_keyboard(matches, 0)
+    msg_id = send_keyboard(chat_id, header, keyboard)
+    if msg_id is not None:
+        with _picker_lock:
+            _picker_sessions[str(chat_id)] = {"login": True, "providers": matches, "page": 0, "header": header}
+
+
+def start_login(chat_id, provider: dict) -> None:
+    key = str(chat_id)
+    with _login_lock:
+        if key in _login_flows:
+            send(chat_id, "\u26a0\ufe0f A login attempt is already in progress for this chat. /stop to cancel it.")
+            return
+        _login_flows[key] = {"provider": provider, "answers": queue.Queue(), "proc": None, "awaiting": None}
+    threading.Thread(target=_login_worker, args=(chat_id, provider), daemon=True).start()
+
+
+def stop_login(chat_id) -> bool:
+    """Cancel any in-flight /login attempt for this chat. Returns True if one
+    was cancelled. If a prompt is pending, unblocks it gracefully so omp gets
+    a real `extension_ui_response`; otherwise there's nothing to answer, so
+    the RPC process is just killed."""
+    key = str(chat_id)
+    with _login_lock:
+        flow = _login_flows.get(key)
+        if flow is None:
+            return False
+        flow["cancel_requested"] = True
+        awaiting, proc = flow.get("awaiting"), flow.get("proc")
+    if awaiting in ("text", "confirm"):
+        flow["answers"].put(_LOGIN_CANCELLED)
+    elif proc is not None:
+        _kill_process_group(proc)
+    return True
+
+
+def _login_send_cmd(proc: subprocess.Popen, obj: dict) -> None:
+    try:
+        proc.stdin.write(json.dumps(obj) + "\n")
+        proc.stdin.flush()
+    except (BrokenPipeError, ValueError, OSError):
+        pass
+
+
+def _handle_login_ui_request(chat_id, key: str, frame: dict, proc: subprocess.Popen, deadline: float) -> bool:
+    """Answer one extension_ui_request from an in-flight login. Returns False
+    if the flow was cancelled (by /stop or a timeout) and the caller should
+    stop; True to keep listening for more frames."""
+    method = frame.get("method")
+    ui_id = frame.get("id")
+
+    if method == "open_url":
+        url = frame.get("url", "")
+        instructions = frame.get("instructions") or ""
+        send(chat_id, (f"{instructions}\n{url}" if instructions else url).strip())
+        return True
+
+    if method == "notify":
+        send(chat_id, frame.get("message", ""))
+        return True
+
+    if method not in ("input", "select", "confirm"):
+        return True  # setWidget/setTitle/setStatus/etc: informational, no response needed
+
+    with _login_lock:
+        flow = _login_flows.get(key)
+        if flow is None:
+            return False
+        flow["awaiting"] = "confirm" if method == "confirm" else "text"
+        flow["ui_id"] = ui_id
+        answers = flow["answers"]
+
+    if method == "confirm":
+        msg = frame.get("message") or frame.get("title") or "Confirm?"
+        send_keyboard(chat_id, f"\u2753 {msg}", {"inline_keyboard": [[_btn("Yes", "lc:yes"), _btn("No", "lc:no")]]})
+    else:
+        title = frame.get("title") or frame.get("message") or "Input needed"
+        prompt = f"\u270f\ufe0f {title}"
+        placeholder = frame.get("placeholder")
+        if placeholder:
+            prompt += f"\n(e.g. {placeholder})"
+        options = frame.get("options")
+        if options:
+            opt_lines = "\n".join(f"  {o.get('label', o) if isinstance(o, dict) else o}" for o in options)
+            prompt += f"\nOptions:\n{opt_lines}"
+        prompt += "\n\nReply with the value, or /stop to cancel."
+        send(chat_id, prompt)
+
+    remaining = deadline - time.monotonic()
+    wait_for = max(1.0, min(remaining, (frame.get("timeout") or LOGIN_TIMEOUT * 1000) / 1000))
+    try:
+        value = answers.get(timeout=wait_for)
+    except queue.Empty:
+        _login_send_cmd(proc, {"type": "extension_ui_response", "id": ui_id, "cancelled": True, "timedOut": True})
+        return False
+
+    with _login_lock:
+        flow = _login_flows.get(key)
+        if flow:
+            flow["awaiting"] = None
+
+    if value is _LOGIN_CANCELLED:
+        _login_send_cmd(proc, {"type": "extension_ui_response", "id": ui_id, "cancelled": True})
+        return False
+    if method == "confirm":
+        _login_send_cmd(proc, {"type": "extension_ui_response", "id": ui_id, "confirmed": bool(value)})
+    else:
+        _login_send_cmd(proc, {"type": "extension_ui_response", "id": ui_id, "value": str(value)})
+    return True
+
+
+def _login_worker(chat_id, provider: dict) -> None:
+    key = str(chat_id)
+    provider_id, provider_name = provider["id"], provider["name"]
+    try:
+        proc = subprocess.Popen(
+            [OMP_BIN, "--mode", "rpc", "--no-session", "--cwd", str(WORKSPACE)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, bufsize=1, start_new_session=True,
+        )
+    except OSError as e:
+        send(chat_id, f"\u26a0\ufe0f couldn't start omp: {e}")
+        with _login_lock:
+            _login_flows.pop(key, None)
+        return
+
+    with _login_lock:
+        flow = _login_flows.get(key)
+        if flow is None:  # /stop already cancelled before the process even started
+            _kill_process_group(proc)
+            return
+        flow["proc"] = proc
+
+    lines: "queue.Queue" = queue.Queue()
+
+    def pump() -> None:
+        try:
+            for raw in proc.stdout:
+                raw = raw.strip()
+                if raw:
+                    lines.put(raw)
+        except Exception:  # noqa: BLE001
+            pass
+        lines.put(None)  # sentinel: stdout closed
+
+    threading.Thread(target=pump, daemon=True).start()
+
+    req_id = "login"
+    _login_send_cmd(proc, {"id": req_id, "type": "login", "providerId": provider_id})
+
+    deadline = time.monotonic() + LOGIN_TIMEOUT
+    result = None
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                result = f"\u231b Login to {provider_name} timed out."
+                break
+            try:
+                line = lines.get(timeout=min(remaining, 5))
+            except queue.Empty:
+                continue
+            if line is None:
+                with _login_lock:
+                    cancelled = bool(_login_flows.get(key, {}).get("cancel_requested"))
+                result = (
+                    f"\U0001f6d1 Login to {provider_name} cancelled."
+                    if cancelled
+                    else f"\u26a0\ufe0f Lost connection to omp during login to {provider_name}."
+                )
+                break
+            try:
+                frame = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            ftype = frame.get("type")
+            if ftype == "response" and frame.get("id") == req_id:
+                if frame.get("success"):
+                    result = f"\u2705 Logged in to {provider_name}."
+                else:
+                    result = f"\u274c Login to {provider_name} failed: {frame.get('error', 'unknown error')}"
+                break
+            if ftype == "extension_ui_request":
+                if not _handle_login_ui_request(chat_id, key, frame, proc, deadline):
+                    result = f"\U0001f6d1 Login to {provider_name} cancelled."
+                    break
+    finally:
+        with _login_lock:
+            _login_flows.pop(key, None)
+        _kill_process_group(proc)
+
+    if result:
+        send(chat_id, result)
 
 
 # ── Cron scheduler ────────────────────────────────────────────────────────────
@@ -1148,6 +1523,16 @@ def handle_message(msg: dict) -> None:
         print(f"[bridge] denied chat {chat_id}", flush=True)
         return
 
+    key = str(chat_id)
+    with _login_lock:
+        flow = _login_flows.get(key)
+    if flow is not None and flow.get("awaiting") == "text":
+        stopword = text.split()[0].lower() if text.startswith("/") else ""
+        if stopword not in ("/stop", "/cancel"):
+            flow["answers"].put(text)
+            send(chat_id, "\U0001f44d Got it, continuing login...")
+            return
+
     if photo or image_document:
         if photo:
             file_id, suffix = photo[-1]["file_id"], ".jpg"
@@ -1165,7 +1550,7 @@ def handle_message(msg: dict) -> None:
     if not attachments and text.startswith("/"):
         cmd = text.split()[0].lstrip("/").split("@")[0].lower()
         if cmd == "start":
-            send(chat_id, "🤖 omp bridge online. Send a message and I'll run it through omp. /reset clears our conversation, /model shows or changes the model, /status shows what's running, /stop cancels it.")
+            send(chat_id, "🤖 omp bridge online. Send a message and I'll run it through omp. /reset clears our conversation, /model shows or changes the model, /login connects a provider account, /status shows what's running, /stop cancels it.")
             return
         if cmd == "reset":
             sdir = session_dir(chat_id)
@@ -1198,25 +1583,49 @@ def handle_message(msg: dict) -> None:
             set_model(arg)
             send(chat_id, f"✅ Model set to {MODEL} (not found in the connected catalog — passed through as-is). Verify with /model.")
             return
+        if cmd == "login":
+            key = str(chat_id)
+            with _login_lock:
+                if key in _login_flows:
+                    send(chat_id, "⚠️ A login attempt is already in progress for this chat. /stop to cancel it.")
+                    return
+            arg = text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else ""
+            if not arg:
+                send_login_picker(chat_id)
+                return
+            matches = search_login_providers(get_login_providers(), arg)
+            if len(matches) == 1:
+                start_login(chat_id, matches[0])
+                return
+            if len(matches) > 1:
+                send_login_search_results(chat_id, arg, matches)
+                return
+            send(chat_id, f"No provider matches {arg!r}. /login shows the full list.")
+            return
         if cmd == "status":
             send(chat_id, status_text(chat_id))
             return
         if cmd == "stop":
             stopped, dropped = stop_run(chat_id)
+            login_stopped = stop_login(chat_id)
+            parts = []
             if stopped and dropped:
-                send(chat_id, f"🛑 Stopping the current run and dropped {dropped} queued message(s).")
+                parts.append(f"🛑 Stopping the current run and dropped {dropped} queued message(s).")
             elif stopped:
-                send(chat_id, "🛑 Stopping the current run...")
+                parts.append("🛑 Stopping the current run...")
             elif dropped:
-                send(chat_id, f"🛑 Dropped {dropped} queued message(s) (nothing was actively running).")
-            else:
-                send(chat_id, "Nothing is running right now.")
+                parts.append(f"🛑 Dropped {dropped} queued message(s) (nothing was actively running).")
+            if login_stopped:
+                parts.append("🛑 Cancelling the in-progress login...")
+            if not parts:
+                parts.append("Nothing is running right now.")
+            send(chat_id, "\n".join(parts))
             return
         if cmd == "update":
             update_bridge(chat_id)
             return
         if cmd == "help":
-            send(chat_id, "Commands: /start, /reset (new conversation), /model [name] (show/change model), /status (what's running), /stop (cancel the current run), /update (pull + restart), /help. Anything else is sent to omp.")
+            send(chat_id, "Commands: /start, /reset (new conversation), /model [name] (show/change model), /login [provider] (connect a provider account), /status (what's running), /stop (cancel the current run), /update (pull + restart), /help. Anything else is sent to omp.")
             return
         # Unknown slash command -> pass through to omp as normal text.
 

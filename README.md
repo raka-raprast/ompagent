@@ -71,6 +71,22 @@ systemctl --user restart omp-bridge
   fuzzy matcher. Either way the choice is saved to `~/.omp-agent/.env` so it
   survives a bridge restart.
 - `/model default` — clears the override, back to omp's configured default.
+- `/login` — opens an inline-keyboard picker over omp's full login-provider
+  list (OAuth subscriptions and API-key providers alike — the same list
+  omp's own interactive `/login` shows, ~50 entries, paginated 10 at a
+  time). Driven over `omp --mode rpc`, since that's the only omp surface
+  built to answer these prompts programmatically instead of a real TTY.
+- `/login <name>` — searches that list by substring. An exact single match
+  starts the flow immediately; multiple matches render as a picker.
+- Once a provider's picked, the bridge relays whatever the flow needs back
+  and forth: a URL to open (just informational — open it in any browser,
+  the flow keeps polling on the bot's side), a value to paste (reply with
+  plain text), or a yes/no (inline buttons). `/stop` cancels an in-flight
+  attempt at any point. `/status` shows one if it's running.
+  A few providers' flows aren't wired for RPC mode at all (e.g. GitHub
+  Copilot as of omp v17) and reply with "requires interactive prompts which
+  are not supported in RPC mode" — for those, SSH in and run `omp` (the real
+  TUI) directly.
 - `/status` — version + commit, current model, whether this chat has a run
   in progress (and for how long), any messages queued behind it, session
   state, bridge uptime, cron job count, and access mode.
