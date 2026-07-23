@@ -27,6 +27,12 @@ Config is read from the environment first, then from ~/.omp-agent/.env
   OMP_BRIDGE_HOME        Base dir for sessions + workspace.
                          Default: ~/.omp-agent/data
   OMP_BRIDGE_TIMEOUT     Per-message omp timeout in seconds (default: 600).
+  OMP_BRIDGE_HEARTBEAT   Seconds of silence before sending a "still working"
+                         message (default: 30; 0 disables). Typing
+                         indicators alone fade/re-arm every few seconds and
+                         can look stalled on long, tool-heavy turns.
+  OMP_BRIDGE_HEARTBEAT_TEXT  Heartbeat message template; "{elapsed}" is
+                         replaced with seconds waited so far.
   OMP_BIN                Path to the omp binary (default: resolve from PATH).
   OMP_BRIDGE_CRON_FILE   Scheduled-job definitions (default: ~/.omp-agent/cron.json).
                          Absent file = no cron jobs. See the "Cron scheduler"
@@ -76,6 +82,8 @@ HOME: Path = AGENT_HOME / "data"
 SESSIONS: Path = HOME / "sessions"
 WORKSPACE: Path = HOME / "workspace"
 TIMEOUT = 600
+HEARTBEAT = 30  # seconds; 0 disables the "still working" nudge entirely
+HEARTBEAT_TEXT = "\u23f3 Still working on it ({elapsed}s so far)... I'll reply as soon as it's done."
 OMP_BIN = ""
 CRON_FILE: Path = AGENT_HOME / "cron.json"
 CRON_STATE_FILE: Path = HOME / "cron_state.json"
@@ -86,7 +94,7 @@ TG_LIMIT = 4096  # Telegram max message length
 
 def configure() -> None:
     """Load run-mode config from the environment. Called once, before main()."""
-    global TOKEN, ALLOW_ALL, ALLOWED, MODEL, HOME, SESSIONS, WORKSPACE, TIMEOUT, OMP_BIN
+    global TOKEN, ALLOW_ALL, ALLOWED, MODEL, HOME, SESSIONS, WORKSPACE, TIMEOUT, HEARTBEAT, HEARTBEAT_TEXT, OMP_BIN
     global CRON_FILE, CRON_STATE_FILE, CRON_JOBS
 
     TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -104,6 +112,8 @@ def configure() -> None:
     SESSIONS = HOME / "sessions"
     WORKSPACE = HOME / "workspace"
     TIMEOUT = int(os.environ.get("OMP_BRIDGE_TIMEOUT", "600"))
+    HEARTBEAT = int(os.environ.get("OMP_BRIDGE_HEARTBEAT", "30"))
+    HEARTBEAT_TEXT = os.environ.get("OMP_BRIDGE_HEARTBEAT_TEXT", "").strip() or HEARTBEAT_TEXT
     OMP_BIN = os.environ.get("OMP_BIN", "") or shutil.which("omp") or str(Path.home() / ".local" / "bin" / "omp")
     CRON_FILE = Path(os.environ.get("OMP_BRIDGE_CRON_FILE", str(AGENT_HOME / "cron.json")))
 
@@ -245,7 +255,9 @@ def run_omp(chat_id, message: str) -> str:
         return f"⚠️ failed to start omp: {e}"
 
 
-    deadline = time.monotonic() + TIMEOUT
+    start = time.monotonic()
+    deadline = start + TIMEOUT
+    next_heartbeat = start + HEARTBEAT if HEARTBEAT > 0 else None
     try:
         while True:
             typing(chat_id)  # re-armed every loop so the indicator never lapses mid-run
@@ -253,10 +265,21 @@ def run_omp(chat_id, message: str) -> str:
                 stdout, _ = proc.communicate(timeout=TYPING_REFRESH)
                 break
             except subprocess.TimeoutExpired:
-                if time.monotonic() >= deadline:
+                now = time.monotonic()
+                if now >= deadline:
                     _kill_process_group(proc)
                     proc.communicate()
                     return f"⏱️ omp timed out after {TIMEOUT}s."
+                if next_heartbeat is not None and now >= next_heartbeat:
+                    # A real message, not just the typing indicator — Telegram's
+                    # typing bubble fades after ~5s and our own re-arm cadence
+                    # (every TYPING_REFRESH) can still read as "stuck" on long,
+                    # tool-heavy turns.
+                    try:
+                        send(chat_id, HEARTBEAT_TEXT.format(elapsed=int(now - start)))
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[bridge] heartbeat send failed: {e}", flush=True)
+                    next_heartbeat = now + HEARTBEAT
     except BaseException:
         _kill_process_group(proc)
         proc.communicate()
