@@ -68,8 +68,11 @@ log_success "python3 found: $(command -v python3)"
 
 # ── 3. omp-agent source ───────────────────────────────────────────────────────
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-if [ -f "$script_dir/bridge.py" ]; then
+script_dir=""
+if [ -n "${BASH_SOURCE[0]:-}" ]; then
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+fi
+if [ -n "$script_dir" ] && [ -f "$script_dir/bridge.py" ]; then
   # Running from a local checkout — use it as-is.
   SRC_DIR="$script_dir"
   log_success "using local checkout: $SRC_DIR"
