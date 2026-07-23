@@ -27,10 +27,14 @@ Config is read from the environment first, then from ~/.omp-agent/.env
   OMP_BRIDGE_HOME        Base dir for sessions + workspace.
                          Default: ~/.omp-agent/data
   OMP_BRIDGE_TIMEOUT     Per-message omp timeout in seconds (default: 600).
-  OMP_BRIDGE_HEARTBEAT   Seconds of silence before sending a "still working"
-                         message (default: 30; 0 disables). Typing
-                         indicators alone fade/re-arm every few seconds and
-                         can look stalled on long, tool-heavy turns.
+  OMP_BRIDGE_HEARTBEAT_FIRST     Seconds of silence before the first "still
+                         working" message (default: 180). 0 disables
+                         heartbeats entirely. Typing indicators alone
+                         fade/re-arm every few seconds and can look stalled
+                         on long, tool-heavy turns.
+  OMP_BRIDGE_HEARTBEAT_INTERVAL  Seconds between subsequent heartbeats after
+                         the first (default: 120). 0 sends only the first
+                         and no more.
   OMP_BRIDGE_HEARTBEAT_TEXT  Heartbeat message template; "{elapsed}" is
                          replaced with seconds waited so far.
   OMP_BIN                Path to the omp binary (default: resolve from PATH).
@@ -82,7 +86,8 @@ HOME: Path = AGENT_HOME / "data"
 SESSIONS: Path = HOME / "sessions"
 WORKSPACE: Path = HOME / "workspace"
 TIMEOUT = 600
-HEARTBEAT = 30  # seconds; 0 disables the "still working" nudge entirely
+HEARTBEAT_FIRST = 180     # seconds before the first "still working" nudge; 0 disables entirely
+HEARTBEAT_INTERVAL = 120  # seconds between subsequent nudges; 0 = first one only
 HEARTBEAT_TEXT = "\u23f3 Still working on it ({elapsed}s so far)... I'll reply as soon as it's done."
 OMP_BIN = ""
 CRON_FILE: Path = AGENT_HOME / "cron.json"
@@ -95,7 +100,8 @@ _STARTED_AT = time.monotonic()  # process start, for /status uptime
 
 def configure() -> None:
     """Load run-mode config from the environment. Called once, before main()."""
-    global TOKEN, ALLOW_ALL, ALLOWED, MODEL, HOME, SESSIONS, WORKSPACE, TIMEOUT, HEARTBEAT, HEARTBEAT_TEXT, OMP_BIN
+    global TOKEN, ALLOW_ALL, ALLOWED, MODEL, HOME, SESSIONS, WORKSPACE, TIMEOUT, OMP_BIN
+    global HEARTBEAT_FIRST, HEARTBEAT_INTERVAL, HEARTBEAT_TEXT
     global CRON_FILE, CRON_STATE_FILE, CRON_JOBS
 
     TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -113,7 +119,8 @@ def configure() -> None:
     SESSIONS = HOME / "sessions"
     WORKSPACE = HOME / "workspace"
     TIMEOUT = int(os.environ.get("OMP_BRIDGE_TIMEOUT", "600"))
-    HEARTBEAT = int(os.environ.get("OMP_BRIDGE_HEARTBEAT", "30"))
+    HEARTBEAT_FIRST = int(os.environ.get("OMP_BRIDGE_HEARTBEAT_FIRST", "180"))
+    HEARTBEAT_INTERVAL = int(os.environ.get("OMP_BRIDGE_HEARTBEAT_INTERVAL", "120"))
     HEARTBEAT_TEXT = os.environ.get("OMP_BRIDGE_HEARTBEAT_TEXT", "").strip() or HEARTBEAT_TEXT
     OMP_BIN = os.environ.get("OMP_BIN", "") or shutil.which("omp") or str(Path.home() / ".local" / "bin" / "omp")
     CRON_FILE = Path(os.environ.get("OMP_BRIDGE_CRON_FILE", str(AGENT_HOME / "cron.json")))
@@ -262,7 +269,7 @@ def run_omp(chat_id, message: str) -> str:
         _active_procs[key] = entry
 
     deadline = start + TIMEOUT
-    next_heartbeat = start + HEARTBEAT if HEARTBEAT > 0 else None
+    next_heartbeat = start + HEARTBEAT_FIRST if HEARTBEAT_FIRST > 0 else None
     try:
         while True:
             typing(chat_id)  # re-armed every loop so the indicator never lapses mid-run
@@ -284,7 +291,7 @@ def run_omp(chat_id, message: str) -> str:
                         send(chat_id, HEARTBEAT_TEXT.format(elapsed=int(now - start)))
                     except Exception as e:  # noqa: BLE001
                         print(f"[bridge] heartbeat send failed: {e}", flush=True)
-                    next_heartbeat = now + HEARTBEAT
+                    next_heartbeat = now + HEARTBEAT_INTERVAL if HEARTBEAT_INTERVAL > 0 else None
     except BaseException:
         _kill_process_group(proc)
         proc.communicate()

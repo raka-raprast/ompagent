@@ -131,7 +131,8 @@ take precedence.
 | `OMP_BRIDGE_MODEL`     | no       | omp's configured default | Model override passed to `omp --model`. |
 | `OMP_BRIDGE_HOME`      | no       | `~/.omp-agent/data`       | Base dir for `sessions/` and `workspace/`. |
 | `OMP_BRIDGE_TIMEOUT`   | no       | `600`                     | Per-message `omp` timeout, in seconds. |
-| `OMP_BRIDGE_HEARTBEAT` | no       | `30`                      | Seconds of silence before sending a "still working" message; `0` disables it. |
+| `OMP_BRIDGE_HEARTBEAT_FIRST` | no | `180`                    | Seconds of silence before the *first* "still working" message; `0` disables heartbeats entirely. |
+| `OMP_BRIDGE_HEARTBEAT_INTERVAL` | no | `120`                 | Seconds between *subsequent* heartbeats; `0` sends only the first. |
 | `OMP_BRIDGE_HEARTBEAT_TEXT` | no  | see below                 | Heartbeat message template; `{elapsed}` is replaced with seconds waited. |
 | `OMP_BIN`              | no       | resolved from `PATH`      | Path to the `omp` binary. |
 | `OMP_BRIDGE_CRON_FILE` | no       | `~/.omp-agent/cron.json`  | Scheduled-job definitions; see [Cron jobs](#cron-jobs). |
