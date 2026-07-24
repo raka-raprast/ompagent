@@ -36,7 +36,7 @@ Config is read from the environment first, then from ~/.omp-agent/.env
                          Changeable at runtime from Telegram via /model.
   OMP_BRIDGE_HOME        Base dir for sessions + workspace.
                          Default: ~/.omp-agent/data
-  OMP_BRIDGE_TIMEOUT     Per-message omp timeout in seconds (default: 600).
+  OMP_BRIDGE_TIMEOUT     Per-message omp timeout in seconds (default: 3600).
   OMP_BRIDGE_HEARTBEAT_FIRST     Seconds of silence before the first "still
                          working" message (default: 180). 0 disables
                          heartbeats entirely. Typing indicators alone
@@ -46,7 +46,7 @@ Config is read from the environment first, then from ~/.omp-agent/.env
                          the first (default: 120). 0 sends only the first
                          and no more.
   OMP_BRIDGE_HEARTBEAT_TEXT  Heartbeat message template; "{elapsed}" is
-                         replaced with seconds waited so far.
+                         replaced with minutes waited so far.
   OMP_BIN                Path to the omp binary (default: resolve from PATH).
   OMP_BRIDGE_CRON_FILE   Scheduled-job definitions (default: ~/.omp-agent/cron.json).
                          Absent file = no cron jobs. See the "Cron scheduler"
@@ -100,10 +100,10 @@ HOME: Path = AGENT_HOME / "data"
 SESSIONS: Path = HOME / "sessions"
 WORKSPACE: Path = HOME / "workspace"
 MEDIA_DIR: Path = HOME / "media"
-TIMEOUT = 600
+TIMEOUT = 3600
 HEARTBEAT_FIRST = 180     # seconds before the first "still working" nudge; 0 disables entirely
 HEARTBEAT_INTERVAL = 120  # seconds between subsequent nudges; 0 = first one only
-HEARTBEAT_TEXT = "\u23f3 Still working on it ({elapsed}s so far)... I'll reply as soon as it's done."
+HEARTBEAT_TEXT = "\u23f3 Still working on it ({elapsed} min so far)... I'll reply as soon as it's done."
 OMP_BIN = ""
 CRON_FILE: Path = AGENT_HOME / "cron.json"
 CRON_STATE_FILE: Path = HOME / "cron_state.json"
@@ -134,7 +134,7 @@ def configure() -> None:
     SESSIONS = HOME / "sessions"
     WORKSPACE = HOME / "workspace"
     MEDIA_DIR = HOME / "media"
-    TIMEOUT = int(os.environ.get("OMP_BRIDGE_TIMEOUT", "600"))
+    TIMEOUT = int(os.environ.get("OMP_BRIDGE_TIMEOUT", "3600"))
     HEARTBEAT_FIRST = int(os.environ.get("OMP_BRIDGE_HEARTBEAT_FIRST", "180"))
     HEARTBEAT_INTERVAL = int(os.environ.get("OMP_BRIDGE_HEARTBEAT_INTERVAL", "120"))
     HEARTBEAT_TEXT = os.environ.get("OMP_BRIDGE_HEARTBEAT_TEXT", "").strip() or HEARTBEAT_TEXT
@@ -286,6 +286,68 @@ def has_session(sdir: Path) -> bool:
     return any(sdir.glob("*.jsonl"))
 
 
+
+def list_sessions(sdir: Path) -> list:
+    """Every session (*.jsonl) in a chat's session dir, newest first."""
+    sessions = []
+    for f in sdir.glob("*.jsonl"):
+        try:
+            mtime = f.stat().st_mtime
+        except OSError:
+            continue
+        sessions.append({"id": f.stem, "mtime": mtime})
+    sessions.sort(key=lambda s: s["mtime"], reverse=True)
+    return sessions
+
+
+def _session_short_id(session_id: str) -> str:
+    """Session files are named '<timestamp>_<uuid>'; the uuid prefix alone is
+    enough to type into /resume and reads far better than the full stem."""
+    uid = session_id.split("_", 1)[1] if "_" in session_id else session_id
+    return uid[:8]
+
+
+ACTIVE_SESSION_MARKER = ".active_session"
+
+
+def get_active_session(sdir: Path) -> str | None:
+    """The session /resume (or the last completed run) pinned as 'current'
+    for this chat, or None to fall back to omp's own --continue heuristic."""
+    try:
+        session_id = (sdir / ACTIVE_SESSION_MARKER).read_text().strip()
+    except OSError:
+        return None
+    if session_id and (sdir / f"{session_id}.jsonl").exists():
+        return session_id
+    return None
+
+
+def set_active_session(sdir: Path, session_id: str | None) -> None:
+    marker = sdir / ACTIVE_SESSION_MARKER
+    try:
+        if session_id:
+            marker.write_text(session_id)
+        else:
+            marker.unlink(missing_ok=True)
+    except OSError as e:
+        print(f"[bridge] failed to update active session marker: {e}", flush=True)
+
+
+def session_list_text(chat_id) -> str:
+    sdir = session_dir(chat_id)
+    sessions = list_sessions(sdir)
+    if not sessions:
+        return "\U0001f5c2 No sessions yet for this chat. Send a message to start one."
+    active = get_active_session(sdir) or sessions[0]["id"]
+    lines = ["\U0001f5c2 Sessions", ""]
+    for s in sessions:
+        marker = "\u2b50 " if s["id"] == active else "   "
+        when = datetime.fromtimestamp(s["mtime"]).strftime("%Y-%m-%d %H:%M")
+        lines.append(f"{marker}{when}  {_session_short_id(s['id'])}")
+    lines.append("")
+    lines.append("/resume <id> switches the active one (any unique substring works).")
+    return "\n".join(lines)
+
 IS_WINDOWS = sys.platform == "win32"
 
 # Every long-lived child (omp itself, or a cron/login subprocess) is launched
@@ -314,8 +376,11 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
 
 def run_omp(chat_id, message: str, attachments: list | None = None) -> str:
     sdir = session_dir(chat_id)
+    active = get_active_session(sdir)
     cmd = [OMP_BIN, "-p", "--session-dir", str(sdir), "--auto-approve", "--cwd", str(WORKSPACE)]
-    if has_session(sdir):
+    if active:
+        cmd += ["--resume", active]
+    elif has_session(sdir):
         cmd.append("--continue")
     if MODEL:
         cmd += ["--model", MODEL]
@@ -356,7 +421,7 @@ def run_omp(chat_id, message: str, attachments: list | None = None) -> str:
                     # (every TYPING_REFRESH) can still read as "stuck" on long,
                     # tool-heavy turns.
                     try:
-                        send(chat_id, HEARTBEAT_TEXT.format(elapsed=int(now - start)))
+                        send(chat_id, HEARTBEAT_TEXT.format(elapsed=round((now - start) / 60)))
                     except Exception as e:  # noqa: BLE001
                         print(f"[bridge] heartbeat send failed: {e}", flush=True)
                     next_heartbeat = now + HEARTBEAT_INTERVAL if HEARTBEAT_INTERVAL > 0 else None
@@ -368,6 +433,10 @@ def run_omp(chat_id, message: str, attachments: list | None = None) -> str:
         with _active_lock:
             _active_procs.pop(key, None)
 
+    sessions = list_sessions(sdir)
+    if sessions:
+        set_active_session(sdir, sessions[0]["id"])
+
     if entry["stopped"]:
         return "🛑 Stopped."
 
@@ -377,7 +446,7 @@ def run_omp(chat_id, message: str, attachments: list | None = None) -> str:
     return out or "(omp produced no output)"
 
 
-# ── Active-run tracking (for /status, /stop) ─────────────────────────────────
+# ── Active-run tracking (for /status, /abort, /stop) ────────────────────────
 
 _active_procs: dict = {}
 _active_lock = threading.Lock()
@@ -418,6 +487,51 @@ def active_run_info(chat_id) -> dict | None:
         return {"started": entry["started"], "message": entry["message"]}
 
 
+# ── Bot pause state (/start, /stop, /restart, /abort) ───────────────────────
+#
+# /stop now means "pause this chat until /start (or /restart)": cancel
+# in-flight work exactly like the old /stop did, then flip this flag so
+# handle_message ignores everything else until the chat is un-paused.
+# /abort is the old /stop — cancel in-flight work, no pause. In-memory only
+# (like _picker_sessions/_login_flows below): a bridge restart always comes
+# back running for every chat.
+
+_stopped_chats: set = set()
+_stopped_lock = threading.Lock()
+_ALWAYS_ALLOWED_WHILE_STOPPED = {"start", "restart", "status", "help", "stop", "abort"}
+
+
+def is_stopped(chat_id) -> bool:
+    with _stopped_lock:
+        return str(chat_id) in _stopped_chats
+
+
+def set_stopped(chat_id, value: bool) -> None:
+    key = str(chat_id)
+    with _stopped_lock:
+        if value:
+            _stopped_chats.add(key)
+        else:
+            _stopped_chats.discard(key)
+
+
+def cancel_current_work(chat_id) -> list:
+    """Kill the in-flight omp run and/or login attempt for this chat, drop
+    queued messages, and return human-readable summary lines (maybe empty)."""
+    stopped_run, dropped = stop_run(chat_id)
+    login_stopped = stop_login(chat_id)
+    parts = []
+    if stopped_run and dropped:
+        parts.append(f"\U0001f6d1 Stopping the current run and dropped {dropped} queued message(s).")
+    elif stopped_run:
+        parts.append("\U0001f6d1 Stopping the current run...")
+    elif dropped:
+        parts.append(f"\U0001f6d1 Dropped {dropped} queued message(s) (nothing was actively running).")
+    if login_stopped:
+        parts.append("\U0001f6d1 Cancelling the in-progress login...")
+    return parts
+
+
 def _format_duration(seconds: float) -> str:
     seconds = int(seconds)
     if seconds < 60:
@@ -436,6 +550,7 @@ def status_text(chat_id) -> str:
     lines = ["\U0001f4ca Status", ""]
     lines.append(f"Version: {_bridge_version()} ({_bridge_commit()})")
     lines.append(f"Model: {MODEL or '(omp config default)'}")
+    lines.append("Bot: \U0001f6d1 stopped for this chat (send /start to resume)" if is_stopped(chat_id) else "Bot: \u25b6 running")
 
     info = active_run_info(chat_id)
     if info:
@@ -450,9 +565,12 @@ def status_text(chat_id) -> str:
         lines.append(f"This chat: logging in to {login_flow['provider']['name']}")
 
     sdir = session_dir(chat_id)
-    lines.append(
-        "Session: in progress" if has_session(sdir) else "Session: none yet (next message starts fresh)"
-    )
+    sessions = list_sessions(sdir)
+    if sessions:
+        active = get_active_session(sdir) or sessions[0]["id"]
+        lines.append(f"Session: {_session_short_id(active)} active ({len(sessions)} total; /session to list)")
+    else:
+        lines.append("Session: none yet (next message starts fresh)")
 
     with _workers_lock:
         q = _workers.get(chat_id)
@@ -1029,7 +1147,7 @@ _login_providers_cache: dict = {"data": None, "fetched_at": 0.0}
 # _handle_login_ui_request. `awaiting` is None, "text", or "confirm".
 _login_flows: dict = {}
 _login_lock = threading.Lock()
-_LOGIN_CANCELLED = object()  # sentinel pushed to `answers` by /stop
+_LOGIN_CANCELLED = object()  # sentinel pushed to `answers` by /stop or /abort
 
 
 def _rpc_call(command: dict, timeout: int = 20) -> dict | None:
@@ -1141,7 +1259,7 @@ def start_login(chat_id, provider: dict) -> None:
     key = str(chat_id)
     with _login_lock:
         if key in _login_flows:
-            send(chat_id, "\u26a0\ufe0f A login attempt is already in progress for this chat. /stop to cancel it.")
+            send(chat_id, "\u26a0\ufe0f A login attempt is already in progress for this chat. /abort to cancel it.")
             return
         _login_flows[key] = {"provider": provider, "answers": queue.Queue(), "proc": None, "awaiting": None}
     threading.Thread(target=_login_worker, args=(chat_id, provider), daemon=True).start()
@@ -1176,7 +1294,7 @@ def _login_send_cmd(proc: subprocess.Popen, obj: dict) -> None:
 
 def _handle_login_ui_request(chat_id, key: str, frame: dict, proc: subprocess.Popen, deadline: float) -> bool:
     """Answer one extension_ui_request from an in-flight login. Returns False
-    if the flow was cancelled (by /stop or a timeout) and the caller should
+    if the flow was cancelled (by /stop, /abort, or a timeout) and the caller should
     stop; True to keep listening for more frames."""
     method = frame.get("method")
     ui_id = frame.get("id")
@@ -1215,7 +1333,7 @@ def _handle_login_ui_request(chat_id, key: str, frame: dict, proc: subprocess.Po
         if options:
             opt_lines = "\n".join(f"  {o.get('label', o) if isinstance(o, dict) else o}" for o in options)
             prompt += f"\nOptions:\n{opt_lines}"
-        prompt += "\n\nReply with the value, or /stop to cancel."
+        prompt += "\n\nReply with the value, or /abort to cancel."
         send(chat_id, prompt)
 
     remaining = deadline - time.monotonic()
@@ -1258,7 +1376,7 @@ def _login_worker(chat_id, provider: dict) -> None:
 
     with _login_lock:
         flow = _login_flows.get(key)
-        if flow is None:  # /stop already cancelled before the process even started
+        if flow is None:  # /stop or /abort already cancelled before the process even started
             _kill_process_group(proc)
             return
         flow["proc"] = proc
@@ -1538,12 +1656,18 @@ def handle_message(msg: dict) -> None:
         print(f"[bridge] denied chat {chat_id}", flush=True)
         return
 
+    if is_stopped(chat_id):
+        cmd_probe = text.split()[0].lstrip("/").split("@")[0].lower() if not attachments and text.startswith("/") else ""
+        if cmd_probe not in _ALWAYS_ALLOWED_WHILE_STOPPED:
+            send(chat_id, "\U0001f6d1 Bot is stopped for this chat. Send /start to resume.")
+            return
+
     key = str(chat_id)
     with _login_lock:
         flow = _login_flows.get(key)
     if flow is not None and flow.get("awaiting") == "text":
         stopword = text.split()[0].lower() if text.startswith("/") else ""
-        if stopword not in ("/stop", "/cancel"):
+        if stopword not in ("/stop", "/abort", "/cancel"):
             flow["answers"].put(text)
             send(chat_id, "\U0001f44d Got it, continuing login...")
             return
@@ -1565,12 +1689,43 @@ def handle_message(msg: dict) -> None:
     if not attachments and text.startswith("/"):
         cmd = text.split()[0].lstrip("/").split("@")[0].lower()
         if cmd == "start":
-            send(chat_id, "🤖 omp bridge online. Send a message and I'll run it through omp. /reset clears our conversation, /model shows or changes the model, /login connects a provider account, /status shows what's running, /stop cancels it.")
+            was_stopped = is_stopped(chat_id)
+            set_stopped(chat_id, False)
+            prefix = "\u25b6 Resumed. " if was_stopped else ""
+            send(chat_id, prefix + "🤖 omp bridge online. Send a message and I'll run it through omp. /reset clears our conversation, /model shows or changes the model, /login connects a provider account, /session lists past sessions (/resume <id> to switch), /status shows what's running, /abort cancels the current run, /stop pauses the bot here.")
+            return
+        if cmd == "restart":
+            parts = cancel_current_work(chat_id)
+            was_stopped = is_stopped(chat_id)
+            set_stopped(chat_id, False)
+            parts.append("\U0001f504 Restarted — bot resumed for this chat." if was_stopped else "\U0001f504 Restarted — cancelled any in-flight work, bot is online.")
+            send(chat_id, "\n".join(parts))
             return
         if cmd == "reset":
             sdir = session_dir(chat_id)
             shutil.rmtree(sdir, ignore_errors=True)
             send(chat_id, "🧹 Conversation reset.")
+            return
+        if cmd == "session":
+            send(chat_id, session_list_text(chat_id))
+            return
+        if cmd == "resume":
+            arg = text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else ""
+            if not arg:
+                send(chat_id, "Usage: /resume <sessionId> — see /session for the list.")
+                return
+            sdir = session_dir(chat_id)
+            matches = [s for s in list_sessions(sdir) if arg.lower() in s["id"].lower()]
+            if not matches:
+                send(chat_id, f"No session matches {arg!r}. /session shows the full list.")
+                return
+            if len(matches) > 1:
+                lines = [f"{len(matches)} sessions match {arg!r} — be more specific:", ""]
+                lines += [f"  {_session_short_id(m['id'])}" for m in matches]
+                send(chat_id, "\n".join(lines))
+                return
+            set_active_session(sdir, matches[0]["id"])
+            send(chat_id, f"\u23ea Resumed session {_session_short_id(matches[0]['id'])}. Next message continues it.")
             return
         if cmd == "model":
             arg = text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else ""
@@ -1602,7 +1757,7 @@ def handle_message(msg: dict) -> None:
             key = str(chat_id)
             with _login_lock:
                 if key in _login_flows:
-                    send(chat_id, "⚠️ A login attempt is already in progress for this chat. /stop to cancel it.")
+                    send(chat_id, "⚠️ A login attempt is already in progress for this chat. /abort to cancel it.")
                     return
             arg = text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else ""
             if not arg:
@@ -1621,17 +1776,13 @@ def handle_message(msg: dict) -> None:
             send(chat_id, status_text(chat_id))
             return
         if cmd == "stop":
-            stopped, dropped = stop_run(chat_id)
-            login_stopped = stop_login(chat_id)
-            parts = []
-            if stopped and dropped:
-                parts.append(f"🛑 Stopping the current run and dropped {dropped} queued message(s).")
-            elif stopped:
-                parts.append("🛑 Stopping the current run...")
-            elif dropped:
-                parts.append(f"🛑 Dropped {dropped} queued message(s) (nothing was actively running).")
-            if login_stopped:
-                parts.append("🛑 Cancelling the in-progress login...")
+            parts = cancel_current_work(chat_id)
+            set_stopped(chat_id, True)
+            parts.append("\U0001f6d1 Bot stopped for this chat. Send /start (or /restart) to resume.")
+            send(chat_id, "\n".join(parts))
+            return
+        if cmd == "abort":
+            parts = cancel_current_work(chat_id)
             if not parts:
                 parts.append("Nothing is running right now.")
             send(chat_id, "\n".join(parts))
@@ -1640,7 +1791,7 @@ def handle_message(msg: dict) -> None:
             update_bridge(chat_id)
             return
         if cmd == "help":
-            send(chat_id, "Commands: /start, /reset (new conversation), /model [name] (show/change model), /login [provider] (connect a provider account), /status (what's running), /stop (cancel the current run), /update (pull + restart), /help. Anything else is sent to omp.")
+            send(chat_id, "Commands: /start (resume), /restart (cancel current run + resume), /stop (pause until /start), /abort (cancel current run), /reset (new conversation), /model [name] (show/change model), /login [provider] (connect a provider account), /session (list sessions), /resume <id> (switch session), /status (what's running), /update (pull + restart), /help. Anything else is sent to omp.")
             return
         # Unknown slash command -> pass through to omp as normal text.
 
@@ -1810,7 +1961,7 @@ def setup_wizard() -> None:
 
     model = _ask("Model override (blank = omp's configured default)", os.environ.get("OMP_BRIDGE_MODEL", ""))
     home = _ask("Data directory (sessions + workspace)", os.environ.get("OMP_BRIDGE_HOME", str(AGENT_HOME / "data")))
-    timeout = _ask("Per-message timeout, seconds", os.environ.get("OMP_BRIDGE_TIMEOUT", "600"))
+    timeout = _ask("Per-message timeout, seconds", os.environ.get("OMP_BRIDGE_TIMEOUT", "3600"))
 
     AGENT_HOME.mkdir(parents=True, exist_ok=True)
     ENV_FILE.write_text(

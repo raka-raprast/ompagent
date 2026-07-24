@@ -65,7 +65,7 @@ python3 bridge.py
 
 Reads config from the environment first, then from `~/.omp-agent/.env`.
 
-Cross-platform: process spawning/killing (`/stop`, cron job timeouts, the
+Cross-platform: process spawning/killing (`/stop`/`/abort`/`/restart`, cron job timeouts, the
 `/login` RPC subprocess) uses real process groups + `SIGKILL` on
 Linux/macOS and `taskkill /T /F` on Windows, so those code paths work
 natively either way — it's only the background-service story
@@ -81,8 +81,29 @@ systemctl --user restart omp-bridge
 
 ## Bot commands
 
-- `/start` — confirms the bridge is online.
-- `/reset` — clears the conversation, starting a fresh omp session.
+- `/start` — brings the bot online for this chat (and clears a `/stop`
+  pause, if one is active).
+- `/restart` — cancels whatever's running for this chat right now (same as
+  `/abort`) and makes sure the bot is running afterward — an `/abort` +
+  `/start` in one command.
+- `/stop` — cancels whatever's running for this chat (same as `/abort`)
+  and then pauses the bot here: every message and command except
+  `/start`, `/restart`, `/status` and `/help` is ignored (with a reminder
+  to `/start`) until you send `/start` or `/restart` again. Pause state is
+  in-memory, like the picker/login state below — a bridge restart always
+  comes back running for every chat.
+- `/abort` — kills the in-flight omp process for this chat and drops any
+  messages still queued behind it. No-op (reports so) if nothing is
+  running. Doesn't pause anything.
+- `/reset` — clears the conversation, starting a fresh omp session (the
+  old session file is left on disk — see `/session` below).
+- `/session` — lists this chat's omp sessions, newest first, each shown as
+  an 8-character short id (a slice of the session's uuid); ⭐ marks the one
+  the next message will continue.
+- `/resume <id>` — switches the active session to whichever one matches
+  `<id>` as a case-insensitive substring; the next message continues that
+  session instead of the latest one. No match, or more than one, reports
+  back instead of guessing.
 - `/model` — opens an inline-keyboard picker: pick a provider, then a model,
   drilling down and paginating in place. Only models the configured
   providers can actually serve show up (a "connected" catalog straight from
@@ -103,17 +124,17 @@ systemctl --user restart omp-bridge
 - Once a provider's picked, the bridge relays whatever the flow needs back
   and forth: a URL to open (just informational — open it in any browser,
   the flow keeps polling on the bot's side), a value to paste (reply with
-  plain text), or a yes/no (inline buttons). `/stop` cancels an in-flight
-  attempt at any point. `/status` shows one if it's running.
+  plain text), or a yes/no (inline buttons). `/abort` (or `/stop`, which
+  also pauses the bot here) cancels an in-flight attempt at any point.
+  `/status` shows one if it's running.
   A few providers' flows aren't wired for RPC mode at all (e.g. GitHub
   Copilot as of omp v17) and reply with "requires interactive prompts which
   are not supported in RPC mode" — for those, SSH in and run `omp` (the real
   TUI) directly.
-- `/status` — version + commit, current model, whether this chat has a run
-  in progress (and for how long), any messages queued behind it, session
-  state, bridge uptime, cron job count, and access mode.
-- `/stop` — kills the in-flight omp process for this chat and drops any
-  messages still queued behind it. No-op (reports so) if nothing is running.
+- `/status` — version + commit, current model, whether the bot is
+  running or paused (`/stop`) for this chat, whether a run is in progress
+  (and for how long), any messages queued behind it, session state (active
+  short id + total count), bridge uptime, cron job count, and access mode.
 - `/update` — `git pull --ff-only` in `OMP_BRIDGE_REPO_DIR` (the checkout,
   default: the directory `bridge.py` lives in); if that actually moved
   `HEAD`, byte-compiles the pulled code and — only if that passes — deploys
@@ -197,10 +218,10 @@ take precedence.
 | `OMP_BRIDGE_ALLOWED`   | yes      | —                         | Comma-separated chat ids, or `*` for everyone. |
 | `OMP_BRIDGE_MODEL`     | no       | omp's configured default | Model override passed to `omp --model`. |
 | `OMP_BRIDGE_HOME`      | no       | `~/.omp-agent/data`       | Base dir for `sessions/` and `workspace/`. |
-| `OMP_BRIDGE_TIMEOUT`   | no       | `600`                     | Per-message `omp` timeout, in seconds. |
+| `OMP_BRIDGE_TIMEOUT`   | no       | `3600`                    | Per-message `omp` timeout, in seconds. |
 | `OMP_BRIDGE_HEARTBEAT_FIRST` | no | `180`                    | Seconds of silence before the *first* "still working" message; `0` disables heartbeats entirely. |
 | `OMP_BRIDGE_HEARTBEAT_INTERVAL` | no | `120`                 | Seconds between *subsequent* heartbeats; `0` sends only the first. |
-| `OMP_BRIDGE_HEARTBEAT_TEXT` | no  | see below                 | Heartbeat message template; `{elapsed}` is replaced with seconds waited. |
+| `OMP_BRIDGE_HEARTBEAT_TEXT` | no  | see below                 | Heartbeat message template; `{elapsed}` is replaced with minutes waited. |
 | `OMP_BIN`              | no       | resolved from `PATH`      | Path to the `omp` binary. |
 | `OMP_BRIDGE_CRON_FILE` | no       | `~/.omp-agent/cron.json`  | Scheduled-job definitions; see [Cron jobs](#cron-jobs). |
 | `OMP_BRIDGE_REPO_DIR`  | no       | dir containing `bridge.py` | Git checkout `/update` pulls in; set automatically by `setup` to the checkout it ran from. Distinct from `~/.omp-agent/release`, the dir the service actually runs from. |
