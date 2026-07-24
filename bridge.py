@@ -104,6 +104,8 @@ TIMEOUT = 3600
 HEARTBEAT_FIRST = 180     # seconds before the first "still working" nudge; 0 disables entirely
 HEARTBEAT_INTERVAL = 120  # seconds between subsequent nudges; 0 = first one only
 HEARTBEAT_TEXT = "\u23f3 Still working on it ({elapsed} min so far)... I'll reply as soon as it's done."
+TYPING_ENABLED = True
+PROGRESS_ENABLED = True
 OMP_BIN = ""
 CRON_FILE: Path = AGENT_HOME / "cron.json"
 CRON_STATE_FILE: Path = HOME / "cron_state.json"
@@ -113,10 +115,17 @@ TG_LIMIT = 4096  # Telegram max message length
 _STARTED_AT = time.monotonic()  # process start, for /status uptime
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("false", "0", "no", "off", "")
+
+
 def configure() -> None:
     """Load run-mode config from the environment. Called once, before main()."""
     global TOKEN, ALLOW_ALL, ALLOWED, MODEL, HOME, SESSIONS, WORKSPACE, MEDIA_DIR, TIMEOUT, OMP_BIN
-    global HEARTBEAT_FIRST, HEARTBEAT_INTERVAL, HEARTBEAT_TEXT
+    global HEARTBEAT_FIRST, HEARTBEAT_INTERVAL, HEARTBEAT_TEXT, TYPING_ENABLED, PROGRESS_ENABLED
     global CRON_FILE, CRON_STATE_FILE, CRON_JOBS
 
     TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -138,6 +147,8 @@ def configure() -> None:
     HEARTBEAT_FIRST = int(os.environ.get("OMP_BRIDGE_HEARTBEAT_FIRST", "180"))
     HEARTBEAT_INTERVAL = int(os.environ.get("OMP_BRIDGE_HEARTBEAT_INTERVAL", "120"))
     HEARTBEAT_TEXT = os.environ.get("OMP_BRIDGE_HEARTBEAT_TEXT", "").strip() or HEARTBEAT_TEXT
+    TYPING_ENABLED = _env_bool("OMP_BRIDGE_TYPING_ENABLED", True)
+    PROGRESS_ENABLED = _env_bool("OMP_BRIDGE_PROGRESS_ENABLED", True)
     OMP_BIN = os.environ.get("OMP_BIN", "") or shutil.which("omp") or str(Path.home() / ".local" / "bin" / "omp")
     CRON_FILE = Path(os.environ.get("OMP_BRIDGE_CRON_FILE", str(AGENT_HOME / "cron.json")))
 
@@ -172,6 +183,23 @@ def set_model(new_model: str) -> None:
     global MODEL
     MODEL = new_model.strip()
     _write_env_var("OMP_BRIDGE_MODEL", MODEL)
+
+
+# ── Runtime toggles (typing indicator / progress heartbeats) ────────────────
+
+
+def set_typing_enabled(enabled: bool) -> None:
+    """Toggle the repeated 'typing...' indicator during a run, in-process and in ~/.omp-agent/.env."""
+    global TYPING_ENABLED
+    TYPING_ENABLED = enabled
+    _write_env_var("OMP_BRIDGE_TYPING_ENABLED", "true" if enabled else "false")
+
+
+def set_progress_enabled(enabled: bool) -> None:
+    """Toggle the periodic 'still working' progress heartbeats, in-process and in ~/.omp-agent/.env."""
+    global PROGRESS_ENABLED
+    PROGRESS_ENABLED = enabled
+    _write_env_var("OMP_BRIDGE_PROGRESS_ENABLED", "true" if enabled else "false")
 
 
 # ── Telegram API helpers ────────────────────────────────────────────────────
@@ -402,10 +430,11 @@ def run_omp(chat_id, message: str, attachments: list | None = None) -> str:
         _active_procs[key] = entry
 
     deadline = start + TIMEOUT
-    next_heartbeat = start + HEARTBEAT_FIRST if HEARTBEAT_FIRST > 0 else None
+    next_heartbeat = start + HEARTBEAT_FIRST if (PROGRESS_ENABLED and HEARTBEAT_FIRST > 0) else None
     try:
         while True:
-            typing(chat_id)  # re-armed every loop so the indicator never lapses mid-run
+            if TYPING_ENABLED:
+                typing(chat_id)  # re-armed every loop so the indicator never lapses mid-run
             try:
                 stdout, _ = proc.communicate(timeout=TYPING_REFRESH)
                 break
@@ -964,6 +993,17 @@ def handle_callback_query(cq: dict) -> None:
         return
 
     key = str(chat_id)
+    if data == "cfg:typing":
+        set_typing_enabled(not TYPING_ENABLED)
+        edit_message(chat_id, message_id, _config_text(), _config_keyboard())
+        answer_callback(cq_id, "Typing status " + ("enabled" if TYPING_ENABLED else "disabled"))
+        return
+
+    if data == "cfg:progress":
+        set_progress_enabled(not PROGRESS_ENABLED)
+        edit_message(chat_id, message_id, _config_text(), _config_keyboard())
+        answer_callback(cq_id, "Progress updates " + ("enabled" if PROGRESS_ENABLED else "disabled"))
+        return
 
     if data == "mx:noop":
         answer_callback(cq_id)
@@ -1444,6 +1484,40 @@ def _login_worker(chat_id, provider: dict) -> None:
         send(chat_id, result)
 
 
+# ── Config ───────────────────────────────────────────────────────────────────
+
+
+def _config_text() -> str:
+    typing_state = "\u2705 ON" if TYPING_ENABLED else "\u2b1c OFF"
+    progress_state = "\u2705 ON" if PROGRESS_ENABLED else "\u2b1c OFF"
+    return (
+        "\u2699 Configuration\n\n"
+        f"\u2328\ufe0f Typing status: {typing_state}\n"
+        f"\U0001f4ca Progress updates: {progress_state} "
+        f"(first nudge after {HEARTBEAT_FIRST // 60} min, then every {HEARTBEAT_INTERVAL // 60} min)\n\n"
+        "Tap a button to toggle."
+    )
+
+
+def _config_keyboard() -> dict:
+    return {
+        "inline_keyboard": [
+            [_btn(
+                "Typing status: " + ("ON \u2192 tap to turn off" if TYPING_ENABLED else "OFF \u2192 tap to turn on"),
+                "cfg:typing",
+            )],
+            [_btn(
+                "Progress updates: " + ("ON \u2192 tap to turn off" if PROGRESS_ENABLED else "OFF \u2192 tap to turn on"),
+                "cfg:progress",
+            )],
+        ]
+    }
+
+
+def send_config(chat_id) -> None:
+    send_keyboard(chat_id, _config_text(), _config_keyboard())
+
+
 # ── Cron scheduler ────────────────────────────────────────────────────────────
 #
 # Job definitions live in a data file (default ~/.omp-agent/cron.json), not in
@@ -1692,7 +1766,7 @@ def handle_message(msg: dict) -> None:
             was_stopped = is_stopped(chat_id)
             set_stopped(chat_id, False)
             prefix = "\u25b6 Resumed. " if was_stopped else ""
-            send(chat_id, prefix + "🤖 omp bridge online. Send a message and I'll run it through omp. /reset clears our conversation, /model shows or changes the model, /login connects a provider account, /session lists past sessions (/resume <id> to switch), /status shows what's running, /abort cancels the current run, /stop pauses the bot here.")
+            send(chat_id, prefix + "🤖 omp bridge online. Send a message and I'll run it through omp. /reset clears our conversation, /model shows or changes the model, /login connects a provider account, /config toggles typing/progress notifications, /session lists past sessions (/resume <id> to switch), /status shows what's running, /abort cancels the current run, /stop pauses the bot here.")
             return
         if cmd == "restart":
             parts = cancel_current_work(chat_id)
@@ -1753,6 +1827,9 @@ def handle_message(msg: dict) -> None:
             set_model(arg)
             send(chat_id, f"✅ Model set to {MODEL} (not found in the connected catalog — passed through as-is). Verify with /model.")
             return
+        if cmd == "config":
+            send_config(chat_id)
+            return
         if cmd == "login":
             key = str(chat_id)
             with _login_lock:
@@ -1791,7 +1868,7 @@ def handle_message(msg: dict) -> None:
             update_bridge(chat_id)
             return
         if cmd == "help":
-            send(chat_id, "Commands: /start (resume), /restart (cancel current run + resume), /stop (pause until /start), /abort (cancel current run), /reset (new conversation), /model [name] (show/change model), /login [provider] (connect a provider account), /session (list sessions), /resume <id> (switch session), /status (what's running), /update (pull + restart), /help. Anything else is sent to omp.")
+            send(chat_id, "Commands: /start (resume), /restart (cancel current run + resume), /stop (pause until /start), /abort (cancel current run), /reset (new conversation), /model [name] (show/change model), /login [provider] (connect a provider account), /config (toggle typing status / progress updates), /session (list sessions), /resume <id> (switch session), /status (what's running), /update (pull + restart), /help. Anything else is sent to omp.")
             return
         # Unknown slash command -> pass through to omp as normal text.
 
